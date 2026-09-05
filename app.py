@@ -326,32 +326,48 @@ def _saida_to_dataframe(slot: SaidaHorariaPonto) -> pd.DataFrame:
 def _render_saida_horaria(
     periodo_label: str,
     saidas: list[SaidaHorariaPonto],
+    *,
+    nested: bool = False,
+    key_prefix: str = "saida",
 ) -> None:
-    st.subheader("Saída horária por produto (ponto / marca / palco)")
+    if nested:
+        st.markdown("**Saída horária por produto (ponto / marca / palco)**")
+    else:
+        st.subheader("Saída horária por produto (ponto / marca / palco)")
     st.caption(
         f"Janela operacional **{periodo_label}** (faixas de 1h). "
         "Produtos da marca do ponto; bebidas rateadas pela participação do ponto no faturamento da hora."
     )
 
     if not saidas:
-        st.info("Sem dados horários para a janela atual.")
+        st.info("Sem dados horários para esta janela.")
         return
 
     for palco in ("Mundo", "Sunset"):
         blocos = [s for s in saidas if s.palco == palco]
         if not blocos:
             continue
-        st.markdown(f"### Palco {palco}")
+        st.markdown(f"{'####' if nested else '###'} Palco {palco}")
         for slot in blocos:
-            with st.expander(
-                f"{slot.ponto} · marca {slot.marca}",
-                expanded=False,
-            ):
-                df = _saida_to_dataframe(slot)
+            titulo = f"{slot.ponto} · marca {slot.marca}"
+            df = _saida_to_dataframe(slot)
+            if nested:
+                st.markdown(f"**{titulo}**")
                 if df.empty:
                     st.caption("Sem saída de produtos neste ponto na janela.")
                 else:
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        df,
+                        use_container_width=True,
+                        hide_index=True,
+                        key=f"{key_prefix}_{slot.ponto}",
+                    )
+            else:
+                with st.expander(titulo, expanded=False):
+                    if df.empty:
+                        st.caption("Sem saída de produtos neste ponto na janela.")
+                    else:
+                        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def _render_dia_metrics(dia: DiaOperacional) -> None:
@@ -415,6 +431,12 @@ def _render_historico(historico: list[DiaOperacional]) -> None:
                 dia.formas_pagamento,
                 dia.categorias,
                 key_prefix=f"hist_mix_{i}",
+            )
+            _render_saida_horaria(
+                dia.periodo,
+                dia.saidas_horarias,
+                nested=True,
+                key_prefix=f"hist_saida_{i}",
             )
 
 

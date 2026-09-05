@@ -67,6 +67,7 @@ class DiaOperacional:
     formas_pagamento: list[ItemValor] = field(default_factory=list)
     palcos: list[ItemValor] = field(default_factory=list)
     categorias: list[ItemValor] = field(default_factory=list)
+    saidas_horarias: list[SaidaHorariaPonto] = field(default_factory=list)
     erro: str | None = None
 
 
@@ -706,15 +707,24 @@ class ZigClient:
     def fetch_saida_horaria(
         self,
         agora: datetime | None = None,
+        inicio: datetime | None = None,
+        fim: datetime | None = None,
+        *,
+        ensure_login: bool = True,
     ) -> tuple[str, list[str], list[SaidaHorariaPonto]]:
         """
-        Saída horária de produtos por ponto, somente na janela operacional atual
-        (12:00–07:00), para economizar consultas.
+        Saída horária de produtos por ponto na janela 12:00–07:00.
+        Se inicio/fim não forem passados, usa a janela operacional atual.
         """
         agora = _aware(agora or datetime.now(TZ))
-        dia_ini, dia_fim = janela_operacional(agora)
+        if inicio is None or fim is None:
+            dia_ini, dia_fim = janela_operacional(agora)
+        else:
+            dia_ini, dia_fim = _aware(inicio), _aware(fim)
+
         faixas = iter_horas_janela(dia_ini, dia_fim)
-        self.login_session()
+        if ensure_login:
+            self.login_session()
 
         horas_labels: list[str] = []
         produtos_por_hora: dict[str, list[ItemValor]] = {}
@@ -746,6 +756,7 @@ class ZigClient:
         self,
         inicio_evento: datetime | None = None,
         agora: datetime | None = None,
+        incluir_saida_horaria: bool = True,
     ) -> list[DiaOperacional]:
         agora = _aware(agora or datetime.now(TZ))
         self.login_session()
@@ -753,7 +764,18 @@ class ZigClient:
         for ini, fim in listar_janelas_anteriores(
             agora, inicio_evento, apenas_dias_oficiais=True
         ):
-            historico.append(self._metricas_periodo(ini, fim))
+            dia = self._metricas_periodo(ini, fim)
+            if incluir_saida_horaria and not dia.erro:
+                try:
+                    _periodo, _horas, saidas = self.fetch_saida_horaria(
+                        inicio=ini,
+                        fim=fim,
+                        ensure_login=False,
+                    )
+                    dia.saidas_horarias = saidas
+                except Exception:
+                    dia.saidas_horarias = []
+            historico.append(dia)
         return historico
 
     def fetch_snapshot(
