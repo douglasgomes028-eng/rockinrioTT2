@@ -75,18 +75,18 @@ def carregar_snapshot(login: str, password: str, evento_id: int, _tick: int):
 
 @st.cache_data(ttl=HISTORICO_TTL_SECONDS, show_spinner=False)
 def carregar_historico(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 3
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 4
 ):
-    """_cache_ver invalida entradas antigas (rateio/fracionado)."""
+    """_cache_ver invalida caches antigos (truncado/não acumulado)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_historico(inicio_evento=EVENTO_INICIO_DEFAULT)
 
 
 @st.cache_data(ttl=SAIDA_HORARIA_TTL_SECONDS, show_spinner=False)
 def carregar_saida_horaria(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 3
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 4
 ):
-    """Somente janela operacional atual (12:00–07:00), contagem inteira."""
+    """Janela operacional atual; saída acumulada a cada 30 min."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_saida_horaria()
 
@@ -340,8 +340,9 @@ def _render_saida_horaria(
     else:
         st.subheader("Saída horária por produto (ponto / marca / palco)")
     st.caption(
-        f"Janela operacional **{periodo_label}** (faixas de 1h). "
-        "Contagem inteira de saída por produto no ponto (Lista de Transações)."
+        f"Janela operacional **{periodo_label}** (marcos a cada 30 min). "
+        "Valores **acumulados** desde o início da janela até cada horário "
+        "(ex.: venda às 13:15 entra a partir de 13:30 / 14:00)."
     )
 
     if not saidas:
@@ -533,7 +534,7 @@ def main() -> None:
     with st.spinner("Carregando saída horária na janela operacional..."):
         try:
             periodo_saida, _horas, saidas = carregar_saida_horaria(
-                cfg["login"], cfg["password"], cfg["evento_id"], saida_bucket, 3
+                cfg["login"], cfg["password"], cfg["evento_id"], saida_bucket, 4
             )
             _render_saida_horaria(periodo_saida, saidas)
         except Exception as exc:  # noqa: BLE001
@@ -542,7 +543,7 @@ def main() -> None:
     with st.spinner("Carregando dias oficiais anteriores..."):
         try:
             historico = carregar_historico(
-                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 3
+                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 4
             )
         except Exception as exc:  # noqa: BLE001
             historico = []

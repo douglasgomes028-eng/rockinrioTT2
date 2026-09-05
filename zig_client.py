@@ -283,10 +283,39 @@ def label_hora(inicio: datetime) -> str:
     return inicio.strftime("%H:%M")
 
 
+def iter_checkpoints_30min(inicio: datetime, fim: datetime) -> list[datetime]:
+    """
+    Marcos a cada 30 min na janela operacional.
+    Ex.: 12:00, 12:30, 13:00, ... até cobrir o fim da janela.
+    """
+    inicio = _aware(inicio)
+    fim = _aware(fim)
+    if fim < inicio:
+        return []
+    pts: list[datetime] = []
+    cursor = inicio.replace(second=0, microsecond=0)
+    # alinha para :00 ou :30
+    if cursor.minute not in (0, 30):
+        if cursor.minute < 30:
+            cursor = cursor.replace(minute=30)
+        else:
+            cursor = (cursor + timedelta(hours=1)).replace(minute=0)
+    while cursor <= fim:
+        pts.append(cursor)
+        cursor = cursor + timedelta(minutes=30)
+    # garante marco final no próximo half-hour se a janela ainda está aberta
+    if not pts:
+        pts.append(inicio.replace(second=0, microsecond=0))
+    last = pts[-1]
+    if last < fim:
+        nxt = last + timedelta(minutes=30)
+        pts.append(nxt)
+    return pts
+
+
 def normalizar_ponto_saida(nome: str) -> str | None:
     """Mapeia ponto (inclui ANTE) para o ponto principal do dashboard."""
     n = nome.upper().replace(" ", "")
-    is_ante = "ANTE" in n
     is_sun = n.startswith("SUN")
     if "MANE" in n:
         return "MUN.A.MANE.AEB04"
@@ -294,8 +323,6 @@ def normalizar_ponto_saida(nome: str) -> str | None:
         return "MUN.A.SIRENE.AEB05"
     if "ESPETTO" in n or "ESPETO" in n:
         return "SUN.A.ESPETTO" if is_sun else "MUN.A.ESPETTO.AEB03"
-    if is_ante:
-        return None
     for _, canon in PONTOS_SAIDA_HORARIA:
         c = canon.upper().replace(" ", "")
         if n == c:
@@ -328,23 +355,9 @@ def _parse_int_qty(text: str) -> int:
         return 0
 
 
-def parse_saida_lista_transacao(
-    html: str,
-    inicio: datetime,
-    fim: datetime,
-) -> list[SaidaHorariaPonto]:
-    """
-    Contagem inteira de saída por produto/ponto/hora a partir da
-    Lista de Transações (tipo detalhado com coluna Produto).
-    """
-    inicio = _aware(inicio)
-    fim = _aware(fim)
-    faixas = iter_horas_janela(inicio, fim)
-    horas_labels = [label_hora(h0) for h0, _ in faixas]
-    if not horas_labels:
-        return []
-
-    soup = _soup(html)
+def extrair_eventos_lista_transacao(html: str) -> list[tuple[datetime, str, str, int]]:
+    """Extrai eventos (dt, ponto, produto, qtd_int) da Lista de Transações detalhada."""
+    soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if not table:
         return []
@@ -361,12 +374,8 @@ def parse_saida_lista_transacao(
     if None in {i_data, i_ponto, i_prod, i_qtd}:
         return []
 
-    # ponto -> produto -> hora -> qtd int
-    buckets: dict[str, dict[str, dict[str, int]]] = {
-        ponto: {} for _, ponto in PONTOS_SAIDA_HORARIA
-    }
-
     ops_ok = {"compra ficha", "retirada de produto", "cancelamento de ficha"}
+    eventos: list[tuple[datetime, str, str, int]] = []
 
     for tr in rows[1:]:
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
@@ -396,54 +405,73 @@ def parse_saida_lista_transacao(
         qtd = _parse_int_qty(cells[i_qtd] if i_qtd < len(cells) else "0")
         if qtd == 0:
             continue
-        if "cancel" in op_l:
-            qtd = -abs(qtd)
-        else:
-            qtd = abs(qtd)
+        qtd = -abs(qtd) if "cancel" in op_l else abs(qtd)
 
         try:
             dt = datetime.strptime(cells[i_data].strip()[:16], "%d/%m/%Y %H:%M")
             dt = dt.replace(tzinfo=TZ)
         except ValueError:
             continue
-        if dt < inicio or dt >= fim:
-            continue
-        hora = label_hora(dt.replace(minute=0, second=0, microsecond=0))
-        if hora not in horas_labels:
-            # horário dentro da janela mas label pode ser o da faixa
-            # usa a faixa cuja início <= dt < fim
-            hora = None
-            for h0, h1 in faixas:
-                if h0 <= dt < h1:
-                    hora = label_hora(h0)
-                    break
-            if not hora:
-                continue
+        eventos.append((dt, ponto, prod, qtd))
+    return eventos
 
-        prod_map = buckets[ponto].setdefault(prod, {h: 0 for h in horas_labels})
-        if hora not in prod_map:
-            prod_map[hora] = 0
-        prod_map[hora] += qtd
+
+def montar_saida_acumulada(
+    eventos: list[tuple[datetime, str, str, int]],
+    inicio: datetime,
+    fim: datetime,
+) -> list[SaidaHorariaPonto]:
+    """
+    Colunas a cada 30 min com total ACUMULADO desde o início da janela
+    até aquele marco (ex.: 12:00=4, 12:30=25, 13:00=29).
+    Venda às 13:15 entra a partir da coluna 13:30 (e seguintes).
+    """
+    inicio = _aware(inicio)
+    fim = _aware(fim)
+    checkpoints = iter_checkpoints_30min(inicio, fim)
+    labels = [c.strftime("%H:%M") for c in checkpoints]
+    if not labels:
+        return montar_saida_horaria_vazia([])
+
+    # ponto -> produto -> lista (dt, qtd)
+    por_ponto: dict[str, dict[str, list[tuple[datetime, int]]]] = {
+        ponto: {} for _, ponto in PONTOS_SAIDA_HORARIA
+    }
+    for dt, ponto, prod, qtd in eventos:
+        if dt < inicio or dt > fim:
+            continue
+        por_ponto.setdefault(ponto, {}).setdefault(prod, []).append((dt, qtd))
 
     result: list[SaidaHorariaPonto] = []
     for palco, ponto in PONTOS_SAIDA_HORARIA:
-        matriz_int = buckets.get(ponto, {})
-        # remove produtos zerados / negativos totais
         matriz: dict[str, dict[str, float]] = {}
-        for prod, por_hora in matriz_int.items():
-            # zera negativos residuais por hora
-            limpo = {h: float(max(0, int(por_hora.get(h, 0)))) for h in horas_labels}
-            if sum(limpo.values()) > 0:
-                matriz[prod] = limpo
+        for prod, pares in por_ponto.get(ponto, {}).items():
+            pares_sorted = sorted(pares, key=lambda x: x[0])
+            col_vals: dict[str, float] = {}
+            running = 0
+            idx = 0
+            for cp, label in zip(checkpoints, labels):
+                while idx < len(pares_sorted) and pares_sorted[idx][0] <= cp:
+                    running += pares_sorted[idx][1]
+                    idx += 1
+                col_vals[label] = float(max(0, running))
+            if running > 0 or any(v > 0 for v in col_vals.values()):
+                # só mantém se houve saída positiva em algum momento
+                if any(v > 0 for v in col_vals.values()):
+                    matriz[prod] = col_vals
         matriz = dict(
-            sorted(matriz.items(), key=lambda kv: sum(kv[1].values()), reverse=True)
+            sorted(
+                matriz.items(),
+                key=lambda kv: list(kv[1].values())[-1] if kv[1] else 0,
+                reverse=True,
+            )
         )
         result.append(
             SaidaHorariaPonto(
                 palco=palco,
                 ponto=ponto,
                 marca=marca_do_ponto(ponto),
-                horas=list(horas_labels),
+                horas=list(labels),
                 matriz=matriz,
             )
         )
@@ -805,8 +833,10 @@ class ZigClient:
         ensure_login: bool = True,
     ) -> tuple[str, list[str], list[SaidaHorariaPonto]]:
         """
-        Saída horária inteira por produto/ponto na janela 12:00–07:00,
-        via Lista de Transações detalhada (1 consulta por janela).
+        Saída acumulada a cada 30 min por produto/ponto na janela 12:00–07:00.
+
+        Busca a Lista de Transações hora a hora (o relatório diário truncado
+        no HTML não traz todas as linhas).
         """
         agora = _aware(agora or datetime.now(TZ))
         if inicio is None or fim is None:
@@ -814,27 +844,32 @@ class ZigClient:
         else:
             dia_ini, dia_fim = _aware(inicio), _aware(fim)
 
-        horas_labels = [label_hora(h0) for h0, _ in iter_horas_janela(dia_ini, dia_fim)]
         periodo_label = _fmt_periodo(dia_ini, dia_fim)
+        checkpoints = iter_checkpoints_30min(dia_ini, dia_fim)
+        labels = [c.strftime("%H:%M") for c in checkpoints]
         if ensure_login:
             self.login_session()
 
-        if not horas_labels:
+        if not labels:
             return periodo_label, [], montar_saida_horaria_vazia([])
 
-        try:
-            html = self.process_report(
-                "lista_transacao",
-                [
-                    f"field-periodo={periodo_label}",
-                    "field-tipo-relatorio-transacao=1",
-                ],
-            )
-            saidas = parse_saida_lista_transacao(html, dia_ini, dia_fim)
-        except Exception:
-            saidas = montar_saida_horaria_vazia(horas_labels)
+        eventos: list[tuple[datetime, str, str, int]] = []
+        for h_ini, h_fim in iter_horas_janela(dia_ini, dia_fim):
+            periodo_hora = _fmt_periodo(h_ini, h_fim)
+            try:
+                html = self.process_report(
+                    "lista_transacao",
+                    [
+                        f"field-periodo={periodo_hora}",
+                        "field-tipo-relatorio-transacao=1",
+                    ],
+                )
+                eventos.extend(extrair_eventos_lista_transacao(html))
+            except Exception:
+                continue
 
-        return periodo_label, horas_labels, saidas
+        saidas = montar_saida_acumulada(eventos, dia_ini, dia_fim)
+        return periodo_label, labels, saidas
 
     def fetch_historico(
         self,
