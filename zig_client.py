@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -14,6 +14,33 @@ from bs4 import BeautifulSoup
 TZ = ZoneInfo("America/Sao_Paulo")
 BASE = "https://netpdv.com/backoffice"
 EVENTO_INICIO_DEFAULT = datetime(2026, 8, 29, 8, 0, tzinfo=TZ)
+
+# Dias oficiais de evento (abertura da janela 12:00)
+DIAS_OFICIAIS: tuple[date, ...] = (
+    date(2026, 9, 2),
+    date(2026, 9, 4),
+    date(2026, 9, 5),
+    date(2026, 9, 6),
+    date(2026, 9, 7),
+    date(2026, 9, 11),
+    date(2026, 9, 12),
+    date(2026, 9, 13),
+)
+
+# Apex-like palette (referência visual)
+COR_AZUL = "#008FFB"
+COR_VERDE = "#00E396"
+COR_LARANJA = "#FEB019"
+COR_ROSA = "#FF4560"
+CORES_PALCO = {"Mundo": COR_AZUL, "Sunset": COR_LARANJA}
+CORES_CATEGORIA = {"Bebida": COR_VERDE, "Comida": COR_LARANJA}
+
+
+@dataclass
+class ItemValor:
+    nome: str
+    quantidade: float = 0.0
+    total: float = 0.0
 
 
 @dataclass
@@ -36,6 +63,10 @@ class DiaOperacional:
     ticket_medio: float
     itens: float
     pontos: list[PontoVenda] = field(default_factory=list)
+    produtos: list[ItemValor] = field(default_factory=list)
+    formas_pagamento: list[ItemValor] = field(default_factory=list)
+    palcos: list[ItemValor] = field(default_factory=list)
+    categorias: list[ItemValor] = field(default_factory=list)
     erro: str | None = None
 
 
@@ -48,6 +79,10 @@ class SnapshotVendas:
     ticket_medio_dia: float
     itens_dia: float
     pontos: list[PontoVenda] = field(default_factory=list)
+    produtos: list[ItemValor] = field(default_factory=list)
+    formas_pagamento: list[ItemValor] = field(default_factory=list)
+    palcos: list[ItemValor] = field(default_factory=list)
+    categorias: list[ItemValor] = field(default_factory=list)
     periodo_total: str = ""
     periodo_dia: str = ""
     historico: list[DiaOperacional] = field(default_factory=list)
@@ -91,8 +126,6 @@ def janela_operacional(agora: datetime | None = None) -> tuple[datetime, datetim
         inicio = agora.replace(hour=12, minute=0, second=0, microsecond=0)
         fim = (inicio + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)
     else:
-        # Antes das 07:00: janela em andamento (ontem 12h → hoje 07h).
-        # Entre 07:00 e 11:59: último dia operacional já encerrado.
         fim = agora.replace(hour=7, minute=0, second=0, microsecond=0)
         inicio = (fim - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
 
@@ -104,38 +137,98 @@ def janela_operacional(agora: datetime | None = None) -> tuple[datetime, datetim
 def listar_janelas_anteriores(
     agora: datetime | None = None,
     inicio_evento: datetime | None = None,
+    apenas_dias_oficiais: bool = True,
 ) -> list[tuple[datetime, datetime]]:
     """
-    Janelas 12:00–07:00 já encerradas antes da janela operacional atual,
-    da mais recente para a mais antiga.
+    Janelas 12:00–07:00 já encerradas antes da janela atual.
+    Por padrão, só dias oficiais do cronograma.
     """
     agora = _aware(agora or datetime.now(TZ))
-    inicio_evento = _aware(inicio_evento or EVENTO_INICIO_DEFAULT)
     atual_ini, _ = janela_operacional(agora)
 
-    # Primeira abertura às 12:00 no dia do início do evento (ou no mesmo dia se já passou das 12h).
-    first = inicio_evento.replace(hour=12, minute=0, second=0, microsecond=0)
-    if first < inicio_evento:
-        first = first + timedelta(days=1)
+    if apenas_dias_oficiais:
+        candidatos = list(DIAS_OFICIAIS)
+    else:
+        inicio_evento = _aware(inicio_evento or EVENTO_INICIO_DEFAULT)
+        first = inicio_evento.replace(hour=12, minute=0, second=0, microsecond=0)
+        if first < inicio_evento:
+            first = first + timedelta(days=1)
+        candidatos = []
+        cursor = first.date()
+        while cursor <= atual_ini.date():
+            candidatos.append(cursor)
+            cursor = cursor + timedelta(days=1)
 
     janelas: list[tuple[datetime, datetime]] = []
-    cursor = first
-    while cursor < atual_ini:
-        fim_completo = (cursor + timedelta(days=1)).replace(
-            hour=7, minute=0, second=0, microsecond=0
-        )
-        if fim_completo <= atual_ini:
-            janelas.append((cursor, fim_completo))
-        cursor = (cursor + timedelta(days=1)).replace(
-            hour=12, minute=0, second=0, microsecond=0
-        )
+    for d in candidatos:
+        inicio = datetime(d.year, d.month, d.day, 12, 0, tzinfo=TZ)
+        fim = (inicio + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)
+        if inicio < atual_ini and fim <= atual_ini:
+            janelas.append((inicio, fim))
 
-    janelas.reverse()
+    janelas.sort(key=lambda x: x[0], reverse=True)
     return janelas
 
 
 def label_janela(inicio: datetime, fim: datetime) -> str:
     return f"{inicio.strftime('%d/%m/%Y')} 12:00 - {fim.strftime('%d/%m/%Y')} 07:00"
+
+
+def palco_do_ponto(nome: str) -> str:
+    n = nome.upper()
+    if n.startswith("SUN") or ".SUN" in n or n.startswith("SUN."):
+        return "Sunset"
+    if n.startswith("MUN") or n.startswith("MUNDO"):
+        return "Mundo"
+    return "Outros"
+
+
+def marca_do_produto(nome: str) -> str:
+    """Classifica produto nas marcas Impettus / bebidas."""
+    n = nome.upper().strip()
+    if n.startswith("(C)"):
+        n = n[3:].strip()
+
+    if "MANE" in n:
+        return "Mane"
+    if (
+        "SIRENE" in n
+        or "FISH" in n
+        or "MIXED" in n
+        or "MIEXD" in n
+        or "SPRITZ" in n
+        or "PIPOCA" in n
+        or "PORCO" in n
+        or "PORQUINHO" in n
+    ):
+        return "Sirene"
+    if (
+        "ESPETO" in n
+        or "ESPS" in n
+        or re.search(r"\bESP\b", n)
+        or " ESP " in f" {n} "
+        or "SAND" in n
+        or n == "FRITAS"
+        or n.startswith("FRITAS")
+    ):
+        return "Espetto"
+
+    drink_kw = (
+        "CHOPE",
+        "HEINEKEN",
+        "HNK",
+        "COCA",
+        "AGUA",
+        "RED BULL",
+        "LAGUN",
+        "FANTA",
+        "CERVEJA",
+        "ULT",
+        "IPA",
+    )
+    if n.startswith("RB") or any(k in n for k in drink_kw):
+        return "Bebidas"
+    return "Outros"
 
 
 def _soup(html: str) -> BeautifulSoup:
@@ -150,12 +243,10 @@ def parse_faturamento_resumo_evento(html: str) -> float:
             continue
         label = cells[0].lower()
         if "total recebido ou movimentação financeira" in label or "total recebido ou movimenta" in label:
-            # Prefer the numeric cell (usually 3rd)
             for cell in reversed(cells):
                 val = _parse_br_number(cell)
                 if val or cell.strip() in {"0", "0,00"}:
                     return val
-    # Fallback: first green table destaque
     m = re.search(
         r"Total Recebido ou Movimenta(?:&ccedil;|ç)(?:&atilde;|ã)o Financeira.*?"
         r"([\d.]+,\d{2})",
@@ -167,8 +258,45 @@ def parse_faturamento_resumo_evento(html: str) -> float:
     return 0.0
 
 
-def parse_itens_produtos_vendidos(html: str) -> float:
-    """Soma quantidades da seção Produtos Vendidos (quando disponível)."""
+def parse_formas_pagamento(html: str) -> list[ItemValor]:
+    """Linhas de forma de pagamento no Resumo Financeiro (antes de Total Devoluções)."""
+    soup = _soup(html)
+    items: list[ItemValor] = []
+    started = False
+    for tr in soup.select("table.resumoEvento tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all("td")]
+        if not cells:
+            continue
+        label = cells[0].strip()
+        label_l = label.lower()
+        if "total recebido ou movimenta" in label_l and "subtraindo" not in label_l:
+            started = True
+            continue
+        if not started:
+            continue
+        if "total devolu" in label_l or "subtraindo" in label_l:
+            break
+        if not label or label == "%":
+            continue
+        valor = 0.0
+        for cell in cells[1:]:
+            v = _parse_br_number(cell)
+            if v > 0 or cell.strip() in {"0", "0,00"}:
+                # pega o primeiro valor monetário relevante (não percentual já limpo)
+                if "," in cell or cell.strip() in {"0", "0,00"}:
+                    valor = v
+                    break
+        nome = label.replace("*", "").strip()
+        if valor > 0:
+            items.append(ItemValor(nome=nome, total=valor))
+    items.sort(key=lambda x: x.total, reverse=True)
+    return items
+
+
+def parse_produtos_vendidos(html: str) -> list[ItemValor]:
+    """
+    Agrega produtos das tabelas Cashless + Fichas (ignora cancelamentos/ambulantes).
+    """
     soup = _soup(html)
     header = None
     for h in soup.find_all(["h3", "h4"]):
@@ -176,36 +304,95 @@ def parse_itens_produtos_vendidos(html: str) -> float:
             header = h
             break
     if not header:
-        return 0.0
+        return []
 
-    total = 0.0
+    skip_headers = {
+        "cashless",
+        "fichas",
+        "cancelamentos",
+        "ambulantes",
+        "total",
+    }
+    agg: dict[str, ItemValor] = {}
+    capture = False
+
     for sib in header.find_all_next():
         if sib.name in {"h3", "h4"} and sib is not header:
             break
-        if sib.name != "tr":
+        if sib.name != "table":
             continue
-        cells = [c.get_text(" ", strip=True) for c in sib.find_all("td")]
-        if len(cells) < 2:
+        rows = sib.find_all("tr")
+        if not rows:
             continue
-        # típico: Nome | Qtd | Valor
-        nome = cells[0].lower()
-        if not nome or "total" in nome:
+        first_cells = [c.get_text(" ", strip=True) for c in rows[0].find_all(["td", "th"])]
+        if not first_cells:
             continue
-        qtd = _parse_br_number(cells[1])
-        if qtd > 0:
-            total += qtd
-    return total
+        section = first_cells[0].strip().lower()
+        if section in {"cashless", "fichas"}:
+            capture = True
+        elif section in {"cancelamentos", "ambulantes"}:
+            capture = False
+            continue
+        if not capture:
+            continue
+
+        for tr in rows:
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+            if len(cells) < 3:
+                continue
+            nome = cells[0].strip()
+            if not nome or nome.lower() in skip_headers:
+                continue
+            if nome.startswith("(C)"):
+                continue
+            qtd = _parse_br_number(cells[1])
+            total = _parse_br_number(cells[2])
+            if qtd == 0 and total == 0:
+                continue
+            key = nome.upper()
+            if key in agg:
+                agg[key].quantidade += qtd
+                agg[key].total += total
+            else:
+                agg[key] = ItemValor(nome=nome, quantidade=qtd, total=total)
+
+    produtos = list(agg.values())
+    produtos.sort(key=lambda p: p.total, reverse=True)
+    return produtos
+
+
+def parse_itens_produtos_vendidos(html: str) -> float:
+    return sum(p.quantidade for p in parse_produtos_vendidos(html))
+
+
+def parse_consumo_categoria(html: str) -> list[ItemValor]:
+    text = _soup(html).get_text("\n", strip=True)
+    items: list[ItemValor] = []
+    for m in re.finditer(
+        r"^(Comida|Bebida)\s+([\d.]+(?:,\d+)?)\s+([\d.]+,\d{2})\s+",
+        text,
+        re.M | re.I,
+    ):
+        items.append(
+            ItemValor(
+                nome=m.group(1).title().replace("Comida", "Comida").replace("Bebida", "Bebida"),
+                quantidade=_parse_br_number(m.group(2)),
+                total=_parse_br_number(m.group(3)),
+            )
+        )
+    # normaliza nomes
+    for it in items:
+        if it.nome.lower().startswith("comida"):
+            it.nome = "Comida"
+        elif it.nome.lower().startswith("bebida"):
+            it.nome = "Bebida"
+    items.sort(key=lambda x: x.total, reverse=True)
+    return items
 
 
 def parse_resumo_ponto(html: str) -> tuple[float, float, list[PontoVenda]]:
-    """
-    Retorna (quantidade_total, valor_total, pontos ordenados por valor desc).
-    Usa a seção CONSUMO do relatório Resumo por Ponto.
-    """
     text = _soup(html).get_text("\n", strip=True)
     pontos: list[PontoVenda] = []
-
-    # Linhas: NOME  QTD  VALOR  %  OPS  MEDIA
     row_re = re.compile(
         r"^([A-Z0-9][A-Z0-9._\-\s]+?)\s+"
         r"([\d.]+(?:,\d+)?)\s+"
@@ -229,8 +416,6 @@ def parse_resumo_ponto(html: str) -> tuple[float, float, list[PontoVenda]]:
 
     qtd_total = sum(p.quantidade for p in pontos)
     valor_total = sum(p.total for p in pontos)
-
-    # Prefer totals declared in header when present
     m_cons = re.search(
         r"CONSUMO\s*-\s*Quantidade:\s*([\d.]+(?:\,\d+)?)\s*Total:\s*([\d.]+,\d{2})",
         text,
@@ -242,6 +427,33 @@ def parse_resumo_ponto(html: str) -> tuple[float, float, list[PontoVenda]]:
 
     pontos.sort(key=lambda p: p.total, reverse=True)
     return qtd_total, valor_total, pontos
+
+
+def agregar_palcos(pontos: list[PontoVenda]) -> list[ItemValor]:
+    buckets: dict[str, ItemValor] = {}
+    for p in pontos:
+        palco = palco_do_ponto(p.nome)
+        if palco not in buckets:
+            buckets[palco] = ItemValor(nome=palco)
+        buckets[palco].quantidade += p.quantidade
+        buckets[palco].total += p.total
+    items = [v for k, v in buckets.items() if k != "Outros" or v.total > 0]
+    # Mundo / Sunset primeiro
+    order = {"Mundo": 0, "Sunset": 1, "Outros": 2}
+    items.sort(key=lambda x: (order.get(x.nome, 9), -x.total))
+    return items
+
+
+def produtos_por_marca(produtos: list[ItemValor]) -> dict[str, list[ItemValor]]:
+    grupos: dict[str, list[ItemValor]] = {}
+    for p in produtos:
+        marca = marca_do_produto(p.nome)
+        grupos.setdefault(marca, []).append(p)
+    for marca in grupos:
+        grupos[marca].sort(key=lambda x: x.total, reverse=True)
+    # ordem estável de marcas
+    ordem = ["Espetto", "Mane", "Sirene", "Bebidas", "Outros"]
+    return {k: grupos[k] for k in ordem if k in grupos}
 
 
 class ZigClient:
@@ -275,13 +487,10 @@ class ZigClient:
             allow_redirects=True,
         )
         r2.raise_for_status()
-        # Confirma sessão carregando home
         home = self.session.get(f"{BASE}/", timeout=60)
         home.raise_for_status()
-        if "Authentication/Login" in home.url and "Relatórios" not in home.text and "Relatorios" not in home.text:
-            # Ainda assim pode estar ok se title for ZIG - Relatórios
-            if "vchLoginUsuario" in home.text and "form-login" in home.text:
-                raise RuntimeError("Falha no login do Zig/netPDV. Verifique usuário e senha.")
+        if "vchLoginUsuario" in home.text and "form-login" in home.text:
+            raise RuntimeError("Falha no login do Zig/netPDV. Verifique usuário e senha.")
 
     def process_report(self, report: str, fields: list[str]) -> str:
         data: dict[str, Any] = {
@@ -289,7 +498,6 @@ class ZigClient:
             "report": report,
             "isMobile": "",
         }
-        # ASP.NET MVC model binder aceita fields / fields[i]
         if len(fields) == 1:
             data["fields"] = fields[0]
         else:
@@ -312,14 +520,22 @@ class ZigClient:
             html_pontos = self.process_report(
                 "resumo_ponto", [f"field-periodo={periodo}"]
             )
+            html_cat = self.process_report(
+                "consumo_categoria", [f"field-periodo={periodo}"]
+            )
+
             fat = parse_faturamento_resumo_evento(html_dia)
             qtd, valor_pontos, pontos = parse_resumo_ponto(html_pontos)
-            itens = parse_itens_produtos_vendidos(html_dia)
-            if itens <= 0:
-                itens = qtd
+            produtos = parse_produtos_vendidos(html_dia)
+            formas = parse_formas_pagamento(html_dia)
+            categorias = parse_consumo_categoria(html_cat)
+            palcos = agregar_palcos(pontos)
+
+            itens = sum(p.quantidade for p in produtos) if produtos else qtd
             if fat <= 0 and valor_pontos > 0:
                 fat = valor_pontos
             ticket = (fat / qtd) if qtd else 0.0
+
             return DiaOperacional(
                 label=label,
                 periodo=periodo,
@@ -330,6 +546,10 @@ class ZigClient:
                 ticket_medio=ticket,
                 itens=itens,
                 pontos=pontos,
+                produtos=produtos,
+                formas_pagamento=formas,
+                palcos=palcos,
+                categorias=categorias,
             )
         except Exception as exc:  # noqa: BLE001
             return DiaOperacional(
@@ -350,10 +570,11 @@ class ZigClient:
         agora: datetime | None = None,
     ) -> list[DiaOperacional]:
         agora = _aware(agora or datetime.now(TZ))
-        inicio_evento = _aware(inicio_evento or EVENTO_INICIO_DEFAULT)
         self.login_session()
         historico: list[DiaOperacional] = []
-        for ini, fim in listar_janelas_anteriores(agora, inicio_evento):
+        for ini, fim in listar_janelas_anteriores(
+            agora, inicio_evento, apenas_dias_oficiais=True
+        ):
             historico.append(self._metricas_periodo(ini, fim))
         return historico
 
@@ -379,7 +600,9 @@ class ZigClient:
             dia_atual = self._metricas_periodo(dia_ini, dia_fim)
             historico: list[DiaOperacional] = []
             if incluir_historico:
-                for ini, fim in listar_janelas_anteriores(agora, inicio_evento):
+                for ini, fim in listar_janelas_anteriores(
+                    agora, inicio_evento, apenas_dias_oficiais=True
+                ):
                     historico.append(self._metricas_periodo(ini, fim))
 
             return SnapshotVendas(
@@ -390,12 +613,16 @@ class ZigClient:
                 ticket_medio_dia=dia_atual.ticket_medio,
                 itens_dia=dia_atual.itens,
                 pontos=dia_atual.pontos,
+                produtos=dia_atual.produtos,
+                formas_pagamento=dia_atual.formas_pagamento,
+                palcos=dia_atual.palcos,
+                categorias=dia_atual.categorias,
                 periodo_total=periodo_total,
                 periodo_dia=periodo_dia,
                 historico=historico,
                 erro=dia_atual.erro,
             )
-        except Exception as exc:  # noqa: BLE001 — superfície no dashboard
+        except Exception as exc:  # noqa: BLE001
             return SnapshotVendas(
                 gerado_em=agora,
                 faturamento_total=0,
