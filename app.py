@@ -74,7 +74,10 @@ def carregar_snapshot(login: str, password: str, evento_id: int, _tick: int):
 
 
 @st.cache_data(ttl=HISTORICO_TTL_SECONDS, show_spinner=False)
-def carregar_historico(login: str, password: str, evento_id: int, _bucket: int):
+def carregar_historico(
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 2
+):
+    """_cache_ver invalida entradas antigas sem saidas_horarias."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_historico(inicio_evento=EVENTO_INICIO_DEFAULT)
 
@@ -434,7 +437,7 @@ def _render_historico(historico: list[DiaOperacional]) -> None:
             )
             _render_saida_horaria(
                 dia.periodo,
-                dia.saidas_horarias,
+                getattr(dia, "saidas_horarias", None) or [],
                 nested=True,
                 key_prefix=f"hist_saida_{i}",
             )
@@ -537,7 +540,7 @@ def main() -> None:
     with st.spinner("Carregando dias oficiais anteriores..."):
         try:
             historico = carregar_historico(
-                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket
+                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 2
             )
         except Exception as exc:  # noqa: BLE001
             historico = []
