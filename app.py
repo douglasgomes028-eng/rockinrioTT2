@@ -75,16 +75,18 @@ def carregar_snapshot(login: str, password: str, evento_id: int, _tick: int):
 
 @st.cache_data(ttl=HISTORICO_TTL_SECONDS, show_spinner=False)
 def carregar_historico(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 2
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 3
 ):
-    """_cache_ver invalida entradas antigas sem saidas_horarias."""
+    """_cache_ver invalida entradas antigas (rateio/fracionado)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_historico(inicio_evento=EVENTO_INICIO_DEFAULT)
 
 
 @st.cache_data(ttl=SAIDA_HORARIA_TTL_SECONDS, show_spinner=False)
-def carregar_saida_horaria(login: str, password: str, evento_id: int, _bucket: int):
-    """Somente janela operacional atual (12:00–07:00), cache mais longo."""
+def carregar_saida_horaria(
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 3
+):
+    """Somente janela operacional atual (12:00–07:00), contagem inteira."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_saida_horaria()
 
@@ -316,12 +318,12 @@ def _saida_to_dataframe(slot: SaidaHorariaPonto) -> pd.DataFrame:
     rows = []
     for produto, por_hora in slot.matriz.items():
         row = {"Produto": produto}
-        total = 0.0
+        total = 0
         for h in slot.horas:
-            q = float(por_hora.get(h, 0.0))
-            row[h] = round(q, 1)
+            q = int(round(float(por_hora.get(h, 0))))
+            row[h] = q
             total += q
-        row["Total"] = round(total, 1)
+        row["Total"] = total
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -339,7 +341,7 @@ def _render_saida_horaria(
         st.subheader("Saída horária por produto (ponto / marca / palco)")
     st.caption(
         f"Janela operacional **{periodo_label}** (faixas de 1h). "
-        "Produtos da marca do ponto; bebidas rateadas pela participação do ponto no faturamento da hora."
+        "Contagem inteira de saída por produto no ponto (Lista de Transações)."
     )
 
     if not saidas:
@@ -531,7 +533,7 @@ def main() -> None:
     with st.spinner("Carregando saída horária na janela operacional..."):
         try:
             periodo_saida, _horas, saidas = carregar_saida_horaria(
-                cfg["login"], cfg["password"], cfg["evento_id"], saida_bucket
+                cfg["login"], cfg["password"], cfg["evento_id"], saida_bucket, 3
             )
             _render_saida_horaria(periodo_saida, saidas)
         except Exception as exc:  # noqa: BLE001
@@ -540,7 +542,7 @@ def main() -> None:
     with st.spinner("Carregando dias oficiais anteriores..."):
         try:
             historico = carregar_historico(
-                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 2
+                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 3
             )
         except Exception as exc:  # noqa: BLE001
             historico = []
