@@ -89,6 +89,27 @@ class SnapshotVendas:
     erro: str | None = None
 
 
+@dataclass
+class SaidaHorariaPonto:
+    """Tabela produto × hora para um ponto (saída estimada na janela operacional)."""
+
+    palco: str
+    ponto: str
+    marca: str
+    horas: list[str]
+    # produto -> {hora_label: quantidade}
+    matriz: dict[str, dict[str, float]] = field(default_factory=dict)
+
+
+# Pontos principais exibidos na saída horária (como no briefing)
+PONTOS_SAIDA_HORARIA: tuple[tuple[str, str], ...] = (
+    ("Mundo", "MUN.A.ESPETTO.AEB03"),
+    ("Mundo", "MUN.A.MANE.AEB04"),
+    ("Mundo", "MUN.A.SIRENE.AEB05"),
+    ("Sunset", "SUN.A.ESPETTO"),
+)
+
+
 def _parse_br_number(text: str) -> float:
     if not text:
         return 0.0
@@ -229,6 +250,124 @@ def marca_do_produto(nome: str) -> str:
     if n.startswith("RB") or any(k in n for k in drink_kw):
         return "Bebidas"
     return "Outros"
+
+
+def marca_do_ponto(nome: str) -> str:
+    n = nome.upper()
+    if "MANE" in n:
+        return "Mane"
+    if "SIRENE" in n:
+        return "Sirene"
+    if "ESPETTO" in n or "ESPETO" in n:
+        return "Espetto"
+    return "Outros"
+
+
+def iter_horas_janela(inicio: datetime, fim: datetime) -> list[tuple[datetime, datetime]]:
+    """Fatias de 1h dentro da janela operacional já usada no app (12:00–07:00)."""
+    inicio = _aware(inicio)
+    fim = _aware(fim)
+    if fim <= inicio:
+        return []
+    cursor = inicio.replace(minute=0, second=0, microsecond=0)
+    faixas: list[tuple[datetime, datetime]] = []
+    while cursor < fim:
+        nxt = cursor + timedelta(hours=1)
+        faixas.append((cursor, min(nxt, fim)))
+        cursor = nxt
+    return faixas
+
+
+def label_hora(inicio: datetime) -> str:
+    return inicio.strftime("%H:%M")
+
+
+def _match_ponto_canonico(nome: str) -> str | None:
+    n = nome.upper().replace(" ", "")
+    if "ANTE" in n:
+        return None
+    for _, canon in PONTOS_SAIDA_HORARIA:
+        c = canon.upper().replace(" ", "")
+        if n == c or c in n or n in c:
+            return canon
+    return None
+
+
+def montar_saida_horaria(
+    horas_labels: list[str],
+    produtos_por_hora: dict[str, list[ItemValor]],
+    pontos_por_hora: dict[str, list[PontoVenda]],
+) -> list[SaidaHorariaPonto]:
+    """
+    O Zig não filtra produto por ponto no resumo_evento.
+    Rateamos a saída horária do produto entre os pontos da mesma marca
+    (e bebidas entre todos) pela participação do ponto no faturamento da hora.
+    """
+    # estrutura vazia
+    saidas: dict[str, SaidaHorariaPonto] = {}
+    for palco, ponto in PONTOS_SAIDA_HORARIA:
+        saidas[ponto] = SaidaHorariaPonto(
+            palco=palco,
+            ponto=ponto,
+            marca=marca_do_ponto(ponto),
+            horas=list(horas_labels),
+            matriz={},
+        )
+
+    for hora in horas_labels:
+        pontos = pontos_por_hora.get(hora, [])
+        # mapa faturamento por ponto canônico (soma se houver variação de nome)
+        fat_ponto: dict[str, float] = {p: 0.0 for p in saidas}
+        for p in pontos:
+            canon = _match_ponto_canonico(p.nome)
+            if canon:
+                fat_ponto[canon] = fat_ponto.get(canon, 0.0) + p.total
+
+        fat_por_marca: dict[str, float] = {}
+        for ponto, fat in fat_ponto.items():
+            m = marca_do_ponto(ponto)
+            fat_por_marca[m] = fat_por_marca.get(m, 0.0) + fat
+        fat_total = sum(fat_ponto.values())
+
+        for prod in produtos_por_hora.get(hora, []):
+            marca_prod = marca_do_produto(prod.nome)
+            for ponto, slot in saidas.items():
+                marca_pt = slot.marca
+                if marca_prod in {"Bebidas", "Outros"}:
+                    base = fat_total
+                    fat = fat_ponto.get(ponto, 0.0)
+                elif marca_prod == marca_pt:
+                    base = fat_por_marca.get(marca_pt, 0.0)
+                    fat = fat_ponto.get(ponto, 0.0)
+                else:
+                    continue
+                if base <= 0 or fat <= 0 or prod.quantidade == 0:
+                    qtd = 0.0
+                else:
+                    qtd = prod.quantidade * (fat / base)
+                if prod.nome not in slot.matriz:
+                    slot.matriz[prod.nome] = {h: 0.0 for h in horas_labels}
+                slot.matriz[prod.nome][hora] = slot.matriz[prod.nome].get(hora, 0.0) + qtd
+
+    # remove produtos zerados em todas as horas
+    result: list[SaidaHorariaPonto] = []
+    for _palco, ponto in PONTOS_SAIDA_HORARIA:
+        slot = saidas[ponto]
+        slot.matriz = {
+            prod: vals
+            for prod, vals in slot.matriz.items()
+            if sum(vals.values()) > 0.05
+        }
+        # ordena produtos pelo total
+        slot.matriz = dict(
+            sorted(
+                slot.matriz.items(),
+                key=lambda kv: sum(kv[1].values()),
+                reverse=True,
+            )
+        )
+        result.append(slot)
+    return result
 
 
 def _soup(html: str) -> BeautifulSoup:
@@ -563,6 +702,45 @@ class ZigClient:
                 itens=0,
                 erro=str(exc),
             )
+
+    def fetch_saida_horaria(
+        self,
+        agora: datetime | None = None,
+    ) -> tuple[str, list[str], list[SaidaHorariaPonto]]:
+        """
+        Saída horária de produtos por ponto, somente na janela operacional atual
+        (12:00–07:00), para economizar consultas.
+        """
+        agora = _aware(agora or datetime.now(TZ))
+        dia_ini, dia_fim = janela_operacional(agora)
+        faixas = iter_horas_janela(dia_ini, dia_fim)
+        self.login_session()
+
+        horas_labels: list[str] = []
+        produtos_por_hora: dict[str, list[ItemValor]] = {}
+        pontos_por_hora: dict[str, list[PontoVenda]] = {}
+
+        for h_ini, h_fim in faixas:
+            label = label_hora(h_ini)
+            periodo = _fmt_periodo(h_ini, h_fim)
+            horas_labels.append(label)
+            try:
+                html_evt = self.process_report(
+                    "resumo_evento", [f"field-periodo={periodo}"]
+                )
+                html_pto = self.process_report(
+                    "resumo_ponto", [f"field-periodo={periodo}"]
+                )
+                produtos_por_hora[label] = parse_produtos_vendidos(html_evt)
+                _, _, pontos = parse_resumo_ponto(html_pto)
+                pontos_por_hora[label] = pontos
+            except Exception:
+                produtos_por_hora[label] = []
+                pontos_por_hora[label] = []
+
+        saidas = montar_saida_horaria(horas_labels, produtos_por_hora, pontos_por_hora)
+        periodo_label = _fmt_periodo(dia_ini, dia_fim)
+        return periodo_label, horas_labels, saidas
 
     def fetch_historico(
         self,

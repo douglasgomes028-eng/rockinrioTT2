@@ -21,6 +21,7 @@ from zig_client import (
     TZ,
     DiaOperacional,
     ItemValor,
+    SaidaHorariaPonto,
     ZigClient,
     janela_operacional,
     produtos_por_marca,
@@ -35,6 +36,7 @@ st.set_page_config(
 
 REFRESH_SECONDS = 60
 HISTORICO_TTL_SECONDS = 30 * 60
+SAIDA_HORARIA_TTL_SECONDS = 15 * 60
 
 CORES_PAGAMENTO = [COR_AZUL, COR_VERDE, COR_LARANJA, COR_ROSA, "#775DD0", "#546E7A"]
 
@@ -75,6 +77,13 @@ def carregar_snapshot(login: str, password: str, evento_id: int, _tick: int):
 def carregar_historico(login: str, password: str, evento_id: int, _bucket: int):
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_historico(inicio_evento=EVENTO_INICIO_DEFAULT)
+
+
+@st.cache_data(ttl=SAIDA_HORARIA_TTL_SECONDS, show_spinner=False)
+def carregar_saida_horaria(login: str, password: str, evento_id: int, _bucket: int):
+    """Somente janela operacional atual (12:00–07:00), cache mais longo."""
+    client = ZigClient(login=login, password=password, evento_id=evento_id)
+    return client.fetch_saida_horaria()
 
 
 def _bar_ranking(df: pd.DataFrame, y_col: str, chart_key: str, height_row: int = 44) -> None:
@@ -298,6 +307,53 @@ def _render_mix_charts(
         )
 
 
+def _saida_to_dataframe(slot: SaidaHorariaPonto) -> pd.DataFrame:
+    if not slot.matriz or not slot.horas:
+        return pd.DataFrame()
+    rows = []
+    for produto, por_hora in slot.matriz.items():
+        row = {"Produto": produto}
+        total = 0.0
+        for h in slot.horas:
+            q = float(por_hora.get(h, 0.0))
+            row[h] = round(q, 1)
+            total += q
+        row["Total"] = round(total, 1)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _render_saida_horaria(
+    periodo_label: str,
+    saidas: list[SaidaHorariaPonto],
+) -> None:
+    st.subheader("Saída horária por produto (ponto / marca / palco)")
+    st.caption(
+        f"Janela operacional **{periodo_label}** (faixas de 1h). "
+        "Produtos da marca do ponto; bebidas rateadas pela participação do ponto no faturamento da hora."
+    )
+
+    if not saidas:
+        st.info("Sem dados horários para a janela atual.")
+        return
+
+    for palco in ("Mundo", "Sunset"):
+        blocos = [s for s in saidas if s.palco == palco]
+        if not blocos:
+            continue
+        st.markdown(f"### Palco {palco}")
+        for slot in blocos:
+            with st.expander(
+                f"{slot.ponto} · marca {slot.marca}",
+                expanded=False,
+            ):
+                df = _saida_to_dataframe(slot)
+                if df.empty:
+                    st.caption("Sem saída de produtos neste ponto na janela.")
+                else:
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 def _render_dia_metrics(dia: DiaOperacional) -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Faturamento", _money(dia.faturamento))
@@ -445,6 +501,16 @@ def main() -> None:
         snap.categorias,
         key_prefix="mix_atual",
     )
+
+    saida_bucket = int(agora.timestamp() // SAIDA_HORARIA_TTL_SECONDS)
+    with st.spinner("Carregando saída horária na janela operacional..."):
+        try:
+            periodo_saida, _horas, saidas = carregar_saida_horaria(
+                cfg["login"], cfg["password"], cfg["evento_id"], saida_bucket
+            )
+            _render_saida_horaria(periodo_saida, saidas)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Não foi possível carregar a saída horária agora: {exc}")
 
     with st.spinner("Carregando dias oficiais anteriores..."):
         try:
