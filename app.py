@@ -66,9 +66,9 @@ def _load_secrets() -> dict:
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def carregar_snapshot(
-    login: str, password: str, evento_id: int, _tick: int, _cache_ver: int = 6
+    login: str, password: str, evento_id: int, _tick: int, _cache_ver: int = 7
 ):
-    """_cache_ver invalida caches antigos (ticket médio = receita / QtdVendas)."""
+    """_cache_ver invalida caches antigos (indicadores Dashboard Ficha)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_snapshot(
         inicio_evento=EVENTO_INICIO_DEFAULT,
@@ -78,9 +78,9 @@ def carregar_snapshot(
 
 @st.cache_data(ttl=HISTORICO_TTL_SECONDS, show_spinner=False)
 def carregar_historico(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 6
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 7
 ):
-    """_cache_ver invalida caches antigos (ticket médio / truncado)."""
+    """_cache_ver invalida caches antigos (indicadores Dashboard Ficha)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_historico(inicio_evento=EVENTO_INICIO_DEFAULT)
 
@@ -385,6 +385,13 @@ def _render_dia_metrics(dia: DiaOperacional) -> None:
     c2.metric("Transações", _int_br(dia.transacoes))
     c3.metric("Ticket médio", _money(dia.ticket_medio))
     c4.metric("Itens vendidos", _int_br(dia.itens))
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Itens cancelados", _int_br(getattr(dia, "itens_cancelados", 0) or 0))
+    c6.metric("Reimpressões", _int_br(getattr(dia, "reimpressoes", 0) or 0))
+    c7.metric(
+        "Dispositivos com venda",
+        _int_br(getattr(dia, "dispositivos_venda", 0) or 0),
+    )
 
 
 def _render_historico(historico: list[DiaOperacional]) -> None:
@@ -412,6 +419,9 @@ def _render_historico(historico: list[DiaOperacional]) -> None:
                 "Transações": d.transacoes,
                 "Ticket médio": d.ticket_medio,
                 "Itens": d.itens,
+                "Itens cancelados": getattr(d, "itens_cancelados", 0) or 0,
+                "Reimpressões": getattr(d, "reimpressoes", 0) or 0,
+                "Dispositivos com venda": getattr(d, "dispositivos_venda", 0) or 0,
             }
             for d in historico
             if not d.erro
@@ -423,6 +433,9 @@ def _render_historico(historico: list[DiaOperacional]) -> None:
         view["Transações"] = view["Transações"].map(_int_br)
         view["Ticket médio"] = view["Ticket médio"].map(_money)
         view["Itens"] = view["Itens"].map(_int_br)
+        view["Itens cancelados"] = view["Itens cancelados"].map(_int_br)
+        view["Reimpressões"] = view["Reimpressões"].map(_int_br)
+        view["Dispositivos com venda"] = view["Dispositivos com venda"].map(_int_br)
         st.dataframe(view, use_container_width=True, hide_index=True)
 
     for i, dia in enumerate(historico):
@@ -519,6 +532,19 @@ def main() -> None:
     c2.metric("Transações do dia", _int_br(snap.transacoes_dia))
     c3.metric("Ticket médio do dia", _money(snap.ticket_medio_dia))
     c4.metric("Itens vendidos do dia", _int_br(snap.itens_dia))
+    c5, c6, c7 = st.columns(3)
+    c5.metric(
+        "Itens cancelados",
+        _int_br(getattr(snap, "itens_cancelados_dia", 0) or 0),
+    )
+    c6.metric(
+        "Reimpressões",
+        _int_br(getattr(snap, "reimpressoes_dia", 0) or 0),
+    )
+    c7.metric(
+        "Dispositivos com venda",
+        _int_br(getattr(snap, "dispositivos_venda_dia", 0) or 0),
+    )
 
     st.subheader("Vendas por ponto (dia operacional)")
     if not snap.pontos:
@@ -547,7 +573,7 @@ def main() -> None:
     with st.spinner("Carregando dias oficiais anteriores..."):
         try:
             historico = carregar_historico(
-                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 6
+                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 7
             )
         except Exception as exc:  # noqa: BLE001
             historico = []

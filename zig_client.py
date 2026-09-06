@@ -62,6 +62,9 @@ class DiaOperacional:
     transacoes: float
     ticket_medio: float
     itens: float
+    itens_cancelados: float = 0.0
+    reimpressoes: float = 0.0
+    dispositivos_venda: float = 0.0
     pontos: list[PontoVenda] = field(default_factory=list)
     produtos: list[ItemValor] = field(default_factory=list)
     formas_pagamento: list[ItemValor] = field(default_factory=list)
@@ -79,6 +82,9 @@ class SnapshotVendas:
     transacoes_dia: float
     ticket_medio_dia: float
     itens_dia: float
+    itens_cancelados_dia: float = 0.0
+    reimpressoes_dia: float = 0.0
+    dispositivos_venda_dia: float = 0.0
     pontos: list[PontoVenda] = field(default_factory=list)
     produtos: list[ItemValor] = field(default_factory=list)
     formas_pagamento: list[ItemValor] = field(default_factory=list)
@@ -88,6 +94,18 @@ class SnapshotVendas:
     periodo_dia: str = ""
     historico: list[DiaOperacional] = field(default_factory=list)
     erro: str | None = None
+
+
+@dataclass
+class DashboardFichaIndicadores:
+    """Indicadores do Dashboard Ficha da Zig."""
+
+    qtd_vendas: float = 0.0
+    itens_vendidos: float = 0.0
+    itens_cancelados: float = 0.0
+    reimpressoes: float = 0.0
+    dispositivos_venda: float = 0.0  # QtdPOS
+    receita: float = 0.0
 
 
 @dataclass
@@ -772,12 +790,11 @@ class ZigClient:
 
     def fetch_dashboard_ficha_indicadores(
         self, periodo: str
-    ) -> tuple[float, float, float]:
+    ) -> DashboardFichaIndicadores:
         """
         Indicadores do Dashboard Ficha (mesma fonte do Ticket Médio na Zig).
 
-        Retorna (QtdVendas, ItensVendidos, receita_formas_pagamento).
-        Ticket Médio Zig = receita_formas_pagamento / QtdVendas.
+        Ticket Médio Zig = receita / QtdVendas.
         """
         self.process_report("dashboard_ficha", [f"field-periodo={periodo}"])
         r = self.session.post(
@@ -792,13 +809,18 @@ class ZigClient:
         r.raise_for_status()
         data = r.json()
         ind = (data.get("indicadores") or [None])[0] or {}
-        qtd_vendas = float(ind.get("QtdVendas") or 0)
-        itens = float(ind.get("ItensVendidos") or 0)
         receita = sum(
             float(x.get("Valor") or 0)
             for x in (data.get("receitaPorFormaPagamento") or [])
         )
-        return qtd_vendas, itens, receita
+        return DashboardFichaIndicadores(
+            qtd_vendas=float(ind.get("QtdVendas") or 0),
+            itens_vendidos=float(ind.get("ItensVendidos") or 0),
+            itens_cancelados=float(ind.get("ItensCancelados") or 0),
+            reimpressoes=float(ind.get("Reimpressoes") or 0),
+            dispositivos_venda=float(ind.get("QtdPOS") or 0),
+            receita=receita,
+        )
 
     def _metricas_periodo(self, inicio: datetime, fim: datetime) -> DiaOperacional:
         periodo = _fmt_periodo(inicio, fim)
@@ -813,9 +835,7 @@ class ZigClient:
             html_cat = self.process_report(
                 "consumo_categoria", [f"field-periodo={periodo}"]
             )
-            qtd_vendas, itens_dash, receita_dash = self.fetch_dashboard_ficha_indicadores(
-                periodo
-            )
+            dash = self.fetch_dashboard_ficha_indicadores(periodo)
 
             fat = parse_faturamento_resumo_evento(html_dia)
             qtd_itens, valor_pontos, pontos = parse_resumo_ponto(html_pontos)
@@ -825,15 +845,15 @@ class ZigClient:
             palcos = agregar_palcos(pontos)
 
             # Alinha com a Zig: Ticket Médio = receita / QtdVendas
-            if receita_dash > 0:
-                fat = receita_dash
+            if dash.receita > 0:
+                fat = dash.receita
             elif fat <= 0 and valor_pontos > 0:
                 fat = valor_pontos
 
-            transacoes = qtd_vendas
+            transacoes = dash.qtd_vendas
             itens = (
-                itens_dash
-                if itens_dash > 0
+                dash.itens_vendidos
+                if dash.itens_vendidos > 0
                 else (
                     sum(p.quantidade for p in produtos) if produtos else qtd_itens
                 )
@@ -849,6 +869,9 @@ class ZigClient:
                 transacoes=transacoes,
                 ticket_medio=ticket,
                 itens=itens,
+                itens_cancelados=dash.itens_cancelados,
+                reimpressoes=dash.reimpressoes,
+                dispositivos_venda=dash.dispositivos_venda,
                 pontos=pontos,
                 produtos=produtos,
                 formas_pagamento=formas,
@@ -975,6 +998,9 @@ class ZigClient:
                 transacoes_dia=dia_atual.transacoes,
                 ticket_medio_dia=dia_atual.ticket_medio,
                 itens_dia=dia_atual.itens,
+                itens_cancelados_dia=dia_atual.itens_cancelados,
+                reimpressoes_dia=dia_atual.reimpressoes,
+                dispositivos_venda_dia=dia_atual.dispositivos_venda,
                 pontos=dia_atual.pontos,
                 produtos=dia_atual.produtos,
                 formas_pagamento=dia_atual.formas_pagamento,
