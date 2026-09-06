@@ -65,7 +65,10 @@ def _load_secrets() -> dict:
 
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def carregar_snapshot(login: str, password: str, evento_id: int, _tick: int):
+def carregar_snapshot(
+    login: str, password: str, evento_id: int, _tick: int, _cache_ver: int = 5
+):
+    """_cache_ver invalida caches antigos (ticket médio = receita / QtdVendas)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_snapshot(
         inicio_evento=EVENTO_INICIO_DEFAULT,
@@ -75,16 +78,16 @@ def carregar_snapshot(login: str, password: str, evento_id: int, _tick: int):
 
 @st.cache_data(ttl=HISTORICO_TTL_SECONDS, show_spinner=False)
 def carregar_historico(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 4
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 5
 ):
-    """_cache_ver invalida caches antigos (truncado/não acumulado)."""
+    """_cache_ver invalida caches antigos (ticket médio / truncado)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_historico(inicio_evento=EVENTO_INICIO_DEFAULT)
 
 
 @st.cache_data(ttl=SAIDA_HORARIA_TTL_SECONDS, show_spinner=False)
 def carregar_saida_horaria(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 4
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 5
 ):
     """Janela operacional atual; saída acumulada a cada 30 min."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
@@ -543,7 +546,7 @@ def main() -> None:
     with st.spinner("Carregando dias oficiais anteriores..."):
         try:
             historico = carregar_historico(
-                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 4
+                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 5
             )
         except Exception as exc:  # noqa: BLE001
             historico = []

@@ -770,6 +770,36 @@ class ZigClient:
         r.raise_for_status()
         return r.text
 
+    def fetch_dashboard_ficha_indicadores(
+        self, periodo: str
+    ) -> tuple[float, float, float]:
+        """
+        Indicadores do Dashboard Ficha (mesma fonte do Ticket Médio na Zig).
+
+        Retorna (QtdVendas, ItensVendidos, receita_formas_pagamento).
+        Ticket Médio Zig = receita_formas_pagamento / QtdVendas.
+        """
+        self.process_report("dashboard_ficha", [f"field-periodo={periodo}"])
+        r = self.session.post(
+            f"{BASE}/Relatorio/GetDashboardFichaData", data={}, timeout=120
+        )
+        if r.status_code == 302 or "form-login" in (r.text or ""):
+            self.login_session()
+            self.process_report("dashboard_ficha", [f"field-periodo={periodo}"])
+            r = self.session.post(
+                f"{BASE}/Relatorio/GetDashboardFichaData", data={}, timeout=120
+            )
+        r.raise_for_status()
+        data = r.json()
+        ind = (data.get("indicadores") or [None])[0] or {}
+        qtd_vendas = float(ind.get("QtdVendas") or 0)
+        itens = float(ind.get("ItensVendidos") or 0)
+        receita = sum(
+            float(x.get("Valor") or 0)
+            for x in (data.get("receitaPorFormaPagamento") or [])
+        )
+        return qtd_vendas, itens, receita
+
     def _metricas_periodo(self, inicio: datetime, fim: datetime) -> DiaOperacional:
         periodo = _fmt_periodo(inicio, fim)
         label = label_janela(inicio, fim)
@@ -783,18 +813,32 @@ class ZigClient:
             html_cat = self.process_report(
                 "consumo_categoria", [f"field-periodo={periodo}"]
             )
+            qtd_vendas, itens_dash, receita_dash = self.fetch_dashboard_ficha_indicadores(
+                periodo
+            )
 
             fat = parse_faturamento_resumo_evento(html_dia)
-            qtd, valor_pontos, pontos = parse_resumo_ponto(html_pontos)
+            qtd_itens, valor_pontos, pontos = parse_resumo_ponto(html_pontos)
             produtos = parse_produtos_vendidos(html_dia)
             formas = parse_formas_pagamento(html_dia)
             categorias = parse_consumo_categoria(html_cat)
             palcos = agregar_palcos(pontos)
 
-            itens = sum(p.quantidade for p in produtos) if produtos else qtd
-            if fat <= 0 and valor_pontos > 0:
+            # Alinha com a Zig: Ticket Médio = receita / QtdVendas
+            if receita_dash > 0:
+                fat = receita_dash
+            elif fat <= 0 and valor_pontos > 0:
                 fat = valor_pontos
-            ticket = (fat / qtd) if qtd else 0.0
+
+            transacoes = qtd_vendas
+            itens = (
+                itens_dash
+                if itens_dash > 0
+                else (
+                    sum(p.quantidade for p in produtos) if produtos else qtd_itens
+                )
+            )
+            ticket = (fat / transacoes) if transacoes else 0.0
 
             return DiaOperacional(
                 label=label,
@@ -802,7 +846,7 @@ class ZigClient:
                 inicio=inicio,
                 fim=fim,
                 faturamento=fat,
-                transacoes=qtd,
+                transacoes=transacoes,
                 ticket_medio=ticket,
                 itens=itens,
                 pontos=pontos,
