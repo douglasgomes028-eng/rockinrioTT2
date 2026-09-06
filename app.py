@@ -66,7 +66,7 @@ def _load_secrets() -> dict:
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
 def carregar_snapshot(
-    login: str, password: str, evento_id: int, _tick: int, _cache_ver: int = 5
+    login: str, password: str, evento_id: int, _tick: int, _cache_ver: int = 6
 ):
     """_cache_ver invalida caches antigos (ticket médio = receita / QtdVendas)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
@@ -78,7 +78,7 @@ def carregar_snapshot(
 
 @st.cache_data(ttl=HISTORICO_TTL_SECONDS, show_spinner=False)
 def carregar_historico(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 5
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 6
 ):
     """_cache_ver invalida caches antigos (ticket médio / truncado)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
@@ -392,7 +392,8 @@ def _render_historico(historico: list[DiaOperacional]) -> None:
     st.subheader("Dias anteriores (cronograma oficial)")
     st.caption(
         "Somente dias oficiais de evento, faixa **12:00 - 07:00** (Brasília). "
-        "Do mais recente ao mais antigo."
+        "Do mais recente ao mais antigo. "
+        "Ticket médio = receita ÷ qtd. de vendas (mesmo critério do Dashboard Ficha da Zig)."
     )
     st.caption(
         "Dias oficiais: "
@@ -546,7 +547,7 @@ def main() -> None:
     with st.spinner("Carregando dias oficiais anteriores..."):
         try:
             historico = carregar_historico(
-                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 5
+                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 6
             )
         except Exception as exc:  # noqa: BLE001
             historico = []
