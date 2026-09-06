@@ -434,15 +434,17 @@ def extrair_eventos_lista_transacao(html: str) -> list[tuple[datetime, str, str,
     return eventos
 
 
-def montar_saida_acumulada(
+def montar_saida_por_intervalo(
     eventos: list[tuple[datetime, str, str, int]],
     inicio: datetime,
     fim: datetime,
 ) -> list[SaidaHorariaPonto]:
     """
-    Colunas a cada 30 min com total ACUMULADO desde o início da janela
-    até aquele marco (ex.: 12:00=4, 12:30=25, 13:00=29).
-    Venda às 13:15 entra a partir da coluna 13:30 (e seguintes).
+    Colunas a cada 30 min com a quantidade SAÍDA NAQUELE INTERVALO
+    (não acumulada). Sem movimento → 0.
+
+    Cada evento entra só no primeiro marco `cp` com dt <= cp
+    (ex.: venda às 13:15 na coluna 13:30).
     """
     inicio = _aware(inicio)
     fim = _aware(fim)
@@ -451,7 +453,6 @@ def montar_saida_acumulada(
     if not labels:
         return montar_saida_horaria_vazia([])
 
-    # ponto -> produto -> lista (dt, qtd)
     por_ponto: dict[str, dict[str, list[tuple[datetime, int]]]] = {
         ponto: {} for _, ponto in PONTOS_SAIDA_HORARIA
     }
@@ -465,22 +466,20 @@ def montar_saida_acumulada(
         matriz: dict[str, dict[str, float]] = {}
         for prod, pares in por_ponto.get(ponto, {}).items():
             pares_sorted = sorted(pares, key=lambda x: x[0])
-            col_vals: dict[str, float] = {}
-            running = 0
+            col_vals: dict[str, float] = {label: 0.0 for label in labels}
             idx = 0
             for cp, label in zip(checkpoints, labels):
+                slot = 0
                 while idx < len(pares_sorted) and pares_sorted[idx][0] <= cp:
-                    running += pares_sorted[idx][1]
+                    slot += pares_sorted[idx][1]
                     idx += 1
-                col_vals[label] = float(max(0, running))
-            if running > 0 or any(v > 0 for v in col_vals.values()):
-                # só mantém se houve saída positiva em algum momento
-                if any(v > 0 for v in col_vals.values()):
-                    matriz[prod] = col_vals
+                col_vals[label] = float(max(0, slot))
+            if any(v > 0 for v in col_vals.values()):
+                matriz[prod] = col_vals
         matriz = dict(
             sorted(
                 matriz.items(),
-                key=lambda kv: list(kv[1].values())[-1] if kv[1] else 0,
+                key=lambda kv: sum(kv[1].values()) if kv[1] else 0,
                 reverse=True,
             )
         )
@@ -494,6 +493,15 @@ def montar_saida_acumulada(
             )
         )
     return result
+
+
+def montar_saida_acumulada(
+    eventos: list[tuple[datetime, str, str, int]],
+    inicio: datetime,
+    fim: datetime,
+) -> list[SaidaHorariaPonto]:
+    """Compat: delega para saída por intervalo (não acumulada)."""
+    return montar_saida_por_intervalo(eventos, inicio, fim)
 
 
 def montar_saida_horaria_vazia(horas_labels: list[str]) -> list[SaidaHorariaPonto]:
@@ -900,8 +908,9 @@ class ZigClient:
         ensure_login: bool = True,
     ) -> tuple[str, list[str], list[SaidaHorariaPonto]]:
         """
-        Saída acumulada a cada 30 min por produto/ponto na janela 12:00–07:00.
+        Saída por intervalo de 30 min por produto/ponto na janela 12:00–07:00.
 
+        Cada coluna é a quantidade daquele intervalo (0 se não houve movimento).
         Busca a Lista de Transações hora a hora (o relatório diário truncado
         no HTML não traz todas as linhas).
         """
