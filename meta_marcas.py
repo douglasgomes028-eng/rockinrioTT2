@@ -18,20 +18,48 @@ RATEIO_MARCA: dict[str, float] = {
     "Sirene": 0.10,
 }
 
-# Meta TOTAL por dia oficial.
-# Valores iguais (META_EVENTO / 8 dias); ajuste fino editando este dict.
-# Marcas = total_dia × RATEIO_MARCA (70/20/10).
-def _metas_iguais() -> dict[date, float]:
-    n = len(DIAS_OFICIAIS)
-    if n <= 0:
-        return {}
-    base = round(META_EVENTO / n, 2)
-    out = {d: base for d in DIAS_OFICIAIS}
-    out[DIAS_OFICIAIS[-1]] = round(META_EVENTO - base * (n - 1), 2)
+# Meta TOTAL por dia oficial — curva do anexo de referência.
+# Dias já ocorridos: valores do print (batem com realizado/% do anexo).
+# Dias futuros: mesma proporção relativa do print, reescalados para
+# a soma de todos os dias fechar exatamente META_EVENTO.
+_META_DIA_OCORRIDOS: dict[date, float] = {
+    date(2026, 9, 2): 60_606.21,
+    date(2026, 9, 4): 748_896.22,
+    date(2026, 9, 5): 644_674.20,
+    date(2026, 9, 6): 810_203.70,
+    date(2026, 9, 7): 895_808.33,
+}
+_META_DIA_FUTUROS_REF: dict[date, float] = {
+    date(2026, 9, 11): 914_530.41,
+    date(2026, 9, 12): 796_544.51,
+    date(2026, 9, 13): 774_604.96,
+}
+
+
+def _metas_do_anexo() -> dict[date, float]:
+    out: dict[date, float] = {d: 0.0 for d in DIAS_OFICIAIS}
+    for d, v in _META_DIA_OCORRIDOS.items():
+        if d in out:
+            out[d] = float(v)
+
+    soma_passados = sum(_META_DIA_OCORRIDOS.get(d, 0.0) for d in DIAS_OFICIAIS)
+    resto = META_EVENTO - soma_passados
+    futuros = [d for d in DIAS_OFICIAIS if d in _META_DIA_FUTUROS_REF]
+    pesos = {d: float(_META_DIA_FUTUROS_REF[d]) for d in futuros}
+    soma_pesos = sum(pesos.values())
+    if futuros and soma_pesos > 0 and resto > 0:
+        for d in futuros[:-1]:
+            out[d] = round(resto * (pesos[d] / soma_pesos), 2)
+        out[futuros[-1]] = round(resto - sum(out[d] for d in futuros[:-1]), 2)
+    elif DIAS_OFICIAIS:
+        # fallback: fecha no último dia
+        out[DIAS_OFICIAIS[-1]] = round(
+            META_EVENTO - sum(out[d] for d in DIAS_OFICIAIS[:-1]), 2
+        )
     return out
 
 
-META_POR_DIA_TOTAL: dict[date, float] = _metas_iguais()
+META_POR_DIA_TOTAL: dict[date, float] = _metas_do_anexo()
 
 
 def meta_marca_dia(dia: date, marca: str) -> float:

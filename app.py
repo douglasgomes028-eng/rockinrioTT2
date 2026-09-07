@@ -95,7 +95,7 @@ def carregar_historico(
 
 @st.cache_data(ttl=HISTORICO_TTL_SECONDS, show_spinner=False)
 def carregar_historico_metas(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 1
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 2
 ):
     """Histórico só com métricas/produtos (sem saída horária) para a grade de metas."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
@@ -715,7 +715,7 @@ def main() -> None:
     with st.spinner("Carregando metas por marca..."):
         try:
             hist_metas = carregar_historico_metas(
-                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 1
+                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 2
             )
         except Exception as exc:  # noqa: BLE001
             hist_metas = []
