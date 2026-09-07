@@ -26,6 +26,14 @@ from zig_client import (
     janela_operacional,
     produtos_por_marca,
 )
+from meta_marcas import (
+    META_EVENTO,
+    CelulaMeta,
+    LinhaMetaDia,
+    agregar_realizado_por_marca,
+    linha_total_meta,
+    montar_linhas_meta,
+)
 
 st.set_page_config(
     page_title="Impettus | RIR26 Vendas",
@@ -83,6 +91,18 @@ def carregar_historico(
     """_cache_ver invalida caches antigos (saída sem truncamento HTML)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
     return client.fetch_historico(inicio_evento=EVENTO_INICIO_DEFAULT)
+
+
+@st.cache_data(ttl=HISTORICO_TTL_SECONDS, show_spinner=False)
+def carregar_historico_metas(
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 1
+):
+    """Histórico só com métricas/produtos (sem saída horária) para a grade de metas."""
+    client = ZigClient(login=login, password=password, evento_id=evento_id)
+    return client.fetch_historico(
+        inicio_evento=EVENTO_INICIO_DEFAULT,
+        incluir_saida_horaria=False,
+    )
 
 
 @st.cache_data(ttl=SAIDA_HORARIA_TTL_SECONDS, show_spinner=False)
@@ -465,6 +485,136 @@ def _render_historico(historico: list[DiaOperacional]) -> None:
             )
 
 
+def _cor_pct_meta(pct: float | None) -> str:
+    if pct is None:
+        return "#9AA0A6"
+    if pct >= 100:
+        return "#00C853"
+    if pct >= 70:
+        return "#FB8C00"
+    return "#E53935"
+
+
+def _html_celula_meta(cel: CelulaMeta) -> str:
+    meta_txt = f"meta {_money(cel.meta)}"
+    if cel.realizado is None:
+        return (
+            f"<div class='meta-cell'>"
+            f"<div class='meta-pending'>ainda não ocorreu</div>"
+            f"<div class='meta-goal'>{meta_txt}</div>"
+            f"</div>"
+        )
+    pct = cel.pct or 0.0
+    cor = _cor_pct_meta(pct)
+    bar = min(max(pct, 0.0), 100.0)
+    return (
+        f"<div class='meta-cell'>"
+        f"<div class='meta-real'>{_money(cel.realizado)}</div>"
+        f"<div class='meta-goal'>{meta_txt}</div>"
+        f"<div class='meta-pct' style='color:{cor}'>{pct:.1f}%</div>"
+        f"<div class='meta-bar'><span style='width:{bar:.1f}%;background:{cor}'></span></div>"
+        f"</div>"
+    )
+
+
+def _render_meta_por_marca(
+    snap_produtos: list[ItemValor],
+    historico: list[DiaOperacional],
+    dia_atual_inicio: datetime,
+    agora: datetime,
+) -> None:
+    st.subheader("Meta por marca e dia")
+
+    realizados: dict = {}
+    for dia in historico:
+        if dia.erro:
+            continue
+        d = dia.inicio.astimezone(TZ).date() if dia.inicio.tzinfo else dia.inicio.date()
+        if d in DIAS_OFICIAIS:
+            realizados[d] = agregar_realizado_por_marca(dia.produtos)
+
+    d_atual = (
+        dia_atual_inicio.astimezone(TZ).date()
+        if dia_atual_inicio.tzinfo
+        else dia_atual_inicio.date()
+    )
+    if d_atual in DIAS_OFICIAIS:
+        realizados[d_atual] = agregar_realizado_por_marca(snap_produtos)
+
+    linhas = montar_linhas_meta(realizados, agora=agora)
+    total = linha_total_meta(linhas)
+    pct_geral = total.total.pct
+    pct_txt = f"{pct_geral:.1f}%".replace(".", ",") if pct_geral is not None else "—"
+
+    st.caption(
+        f"meta do evento **{_money(META_EVENTO)}** · realizado **{pct_txt}** · "
+        "bebidas rateadas **70% Espetto / 20% Mané / 10% Sirene**"
+    )
+
+    headers = ["DIA", "ESPETTO", "MANÉ", "SIRENE", "TOTAL"]
+    marca_keys = ["Espetto", "Mane", "Sirene"]
+
+    def _row_html(lin: LinhaMetaDia, strong: bool = False) -> str:
+        cls = "meta-row meta-row-total" if strong else "meta-row"
+        cells = [_html_celula_meta(lin.celulas[m]) for m in marca_keys]
+        cells.append(_html_celula_meta(lin.total))
+        label = f"<strong>{lin.label}</strong>" if strong else lin.label
+        tds = "".join(f"<td>{c}</td>" for c in cells)
+        return f"<tr class='{cls}'><td class='meta-dia'>{label}</td>{tds}</tr>"
+
+    thead = "".join(f"<th>{h}</th>" for h in headers)
+    body = "".join(_row_html(lin) for lin in linhas) + _row_html(total, strong=True)
+
+    st.markdown(
+        f"""
+        <style>
+        .meta-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.92rem;
+            margin: 0.4rem 0 1rem 0;
+        }}
+        .meta-table th {{
+            text-align: left;
+            padding: 0.55rem 0.6rem;
+            border-bottom: 1px solid rgba(128,128,128,0.35);
+            color: #9AA0A6;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        }}
+        .meta-table td {{
+            vertical-align: top;
+            padding: 0.55rem 0.6rem;
+            border-bottom: 1px solid rgba(128,128,128,0.18);
+        }}
+        .meta-dia {{ white-space: nowrap; font-weight: 600; width: 7.5rem; }}
+        .meta-cell {{ min-width: 7.5rem; }}
+        .meta-real {{ font-weight: 700; font-size: 1.02rem; }}
+        .meta-goal {{ color: #9AA0A6; font-size: 0.82rem; margin-top: 0.1rem; }}
+        .meta-pct {{ font-weight: 600; font-size: 0.88rem; margin-top: 0.15rem; }}
+        .meta-pending {{ color: #9AA0A6; font-style: italic; }}
+        .meta-bar {{
+            margin-top: 0.35rem;
+            height: 4px;
+            background: rgba(128,128,128,0.2);
+            border-radius: 2px;
+            overflow: hidden;
+        }}
+        .meta-bar span {{ display: block; height: 100%; border-radius: 2px; }}
+        .meta-row-total td {{
+            border-top: 1px solid rgba(128,128,128,0.45);
+            background: rgba(128,128,128,0.06);
+        }}
+        </style>
+        <table class="meta-table">
+          <thead><tr>{thead}</tr></thead>
+          <tbody>{body}</tbody>
+        </table>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main() -> None:
     st.markdown(
         """
@@ -561,6 +711,16 @@ def main() -> None:
         snap.categorias,
         key_prefix="mix_atual",
     )
+
+    with st.spinner("Carregando metas por marca..."):
+        try:
+            hist_metas = carregar_historico_metas(
+                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 1
+            )
+        except Exception as exc:  # noqa: BLE001
+            hist_metas = []
+            st.warning(f"Não foi possível carregar metas por marca agora: {exc}")
+    _render_meta_por_marca(snap.produtos, hist_metas, dia_ini, agora)
 
     saida_bucket = int(agora.timestamp() // SAIDA_HORARIA_TTL_SECONDS)
     with st.spinner("Carregando saída horária na janela operacional..."):
