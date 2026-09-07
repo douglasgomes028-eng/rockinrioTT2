@@ -373,8 +373,42 @@ def _parse_int_qty(text: str) -> int:
         return 0
 
 
-def extrair_eventos_lista_transacao(html: str) -> list[tuple[datetime, str, str, int]]:
-    """Extrai eventos (dt, ponto, produto, qtd_int) da Lista de Transações detalhada."""
+def _count_lista_transacao_rows(html: str) -> int:
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return 0
+    return max(0, len(table.find_all("tr")) - 1)
+
+
+# HTML do relatório lista_transacao trunca por volta de ~150 linhas.
+LISTA_TRANSACAO_ROW_SOFT_LIMIT = 145
+LISTA_TRANSACAO_MIN_SPAN = timedelta(minutes=1)
+LISTA_TRANSACAO_BASE_MINUTES = 5
+
+
+def iter_fatias_minutos(
+    inicio: datetime, fim: datetime, minutos: int = LISTA_TRANSACAO_BASE_MINUTES
+) -> list[tuple[datetime, datetime]]:
+    """Fatias fixas dentro da janela (ex.: 10 em 10 minutos)."""
+    inicio = _aware(inicio)
+    fim = _aware(fim)
+    if fim <= inicio or minutos <= 0:
+        return []
+    faixas: list[tuple[datetime, datetime]] = []
+    cursor = inicio
+    step = timedelta(minutes=minutos)
+    while cursor < fim:
+        nxt = min(cursor + step, fim)
+        faixas.append((cursor, nxt))
+        cursor = nxt
+    return faixas
+
+
+def extrair_eventos_lista_transacao(
+    html: str,
+) -> list[tuple[datetime, str, str, int, str]]:
+    """Extrai eventos (dt, ponto, produto, qtd_int, tx_id) da Lista detalhada."""
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if not table:
@@ -389,11 +423,12 @@ def extrair_eventos_lista_transacao(html: str) -> list[tuple[datetime, str, str,
     i_prod = _find_col(header, "Produto")
     i_qtd = _find_col(header, "Quantidade")
     i_status = _find_col(header, "Status")
+    i_tx = _find_col(header, "Transação ID", "Transacao ID", "Transação", "Transacao")
     if None in {i_data, i_ponto, i_prod, i_qtd}:
         return []
 
     ops_ok = {"compra ficha", "retirada de produto", "cancelamento de ficha"}
-    eventos: list[tuple[datetime, str, str, int]] = []
+    eventos: list[tuple[datetime, str, str, int, str]] = []
 
     for tr in rows[1:]:
         cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
@@ -430,8 +465,32 @@ def extrair_eventos_lista_transacao(html: str) -> list[tuple[datetime, str, str,
             dt = dt.replace(tzinfo=TZ)
         except ValueError:
             continue
-        eventos.append((dt, ponto, prod, qtd))
+        tx_id = ""
+        if i_tx is not None and i_tx < len(cells):
+            tx_id = cells[i_tx].strip()
+        elif cells:
+            tx_id = cells[0].strip()
+        eventos.append((dt, ponto, prod, qtd, tx_id))
     return eventos
+
+
+def _dedupe_eventos(
+    eventos: list[tuple[datetime, str, str, int, str]],
+) -> list[tuple[datetime, str, str, int]]:
+    """Remove linhas duplicadas entre fatias sobrepostas (tx+produto+ponto+qtd)."""
+    seen: set[str] = set()
+    out: list[tuple[datetime, str, str, int]] = []
+    for dt, ponto, prod, qtd, tx_id in eventos:
+        key = (
+            f"{tx_id}|{ponto}|{prod}|{qtd}"
+            if tx_id
+            else f"{dt.isoformat()}|{ponto}|{prod}|{qtd}"
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((dt, ponto, prod, qtd))
+    return out
 
 
 def montar_saida_por_intervalo(
@@ -899,6 +958,42 @@ class ZigClient:
                 erro=str(exc),
             )
 
+    def _fetch_lista_eventos_periodo(
+        self, inicio: datetime, fim: datetime
+    ) -> list[tuple[datetime, str, str, int, str]]:
+        """
+        Lista de Transações com bisect quando o HTML parece truncado.
+        """
+        inicio = _aware(inicio)
+        fim = _aware(fim)
+        if fim <= inicio:
+            return []
+        try:
+            html = self.process_report(
+                "lista_transacao",
+                [
+                    f"field-periodo={_fmt_periodo(inicio, fim)}",
+                    "field-tipo-relatorio-transacao=1",
+                ],
+            )
+        except Exception:
+            return []
+
+        n_rows = _count_lista_transacao_rows(html)
+        span = fim - inicio
+        if (
+            n_rows >= LISTA_TRANSACAO_ROW_SOFT_LIMIT
+            and span > LISTA_TRANSACAO_MIN_SPAN
+        ):
+            mid = inicio + timedelta(seconds=int(span.total_seconds() // 2))
+            if mid <= inicio or mid >= fim:
+                return extrair_eventos_lista_transacao(html)
+            return self._fetch_lista_eventos_periodo(
+                inicio, mid
+            ) + self._fetch_lista_eventos_periodo(mid, fim)
+
+        return extrair_eventos_lista_transacao(html)
+
     def fetch_saida_horaria(
         self,
         agora: datetime | None = None,
@@ -911,8 +1006,8 @@ class ZigClient:
         Saída por intervalo de 30 min por produto/ponto na janela 12:00–07:00.
 
         Cada coluna é a quantidade daquele intervalo (0 se não houve movimento).
-        Busca a Lista de Transações hora a hora (o relatório diário truncado
-        no HTML não traz todas as linhas).
+        Busca a Lista de Transações em fatias de 5 min, com subdivisão automática
+        quando o HTML da Zig trunca (~150 linhas).
         """
         agora = _aware(agora or datetime.now(TZ))
         if inicio is None or fim is None:
@@ -929,22 +1024,12 @@ class ZigClient:
         if not labels:
             return periodo_label, [], montar_saida_horaria_vazia([])
 
-        eventos: list[tuple[datetime, str, str, int]] = []
-        for h_ini, h_fim in iter_horas_janela(dia_ini, dia_fim):
-            periodo_hora = _fmt_periodo(h_ini, h_fim)
-            try:
-                html = self.process_report(
-                    "lista_transacao",
-                    [
-                        f"field-periodo={periodo_hora}",
-                        "field-tipo-relatorio-transacao=1",
-                    ],
-                )
-                eventos.extend(extrair_eventos_lista_transacao(html))
-            except Exception:
-                continue
+        bruto: list[tuple[datetime, str, str, int, str]] = []
+        for f_ini, f_fim in iter_fatias_minutos(dia_ini, dia_fim):
+            bruto.extend(self._fetch_lista_eventos_periodo(f_ini, f_fim))
 
-        saidas = montar_saida_acumulada(eventos, dia_ini, dia_fim)
+        eventos = _dedupe_eventos(bruto)
+        saidas = montar_saida_por_intervalo(eventos, dia_ini, dia_fim)
         return periodo_label, labels, saidas
 
     def fetch_historico(
