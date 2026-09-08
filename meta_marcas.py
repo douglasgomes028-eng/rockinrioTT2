@@ -18,64 +18,15 @@ RATEIO_MARCA: dict[str, float] = {
     "Sirene": 0.10,
 }
 
-# Metas do print de referência (anexo original), já no rateio 70/20/10.
-# Ex.: 06/09 Sirene = R$ 77.533,51 (10% de R$ 775.335,06).
-META_VERSAO = "print-anexo-4"
+META_VERSAO = "dinamica-saldo-v1"
 
-META_POR_DIA_MARCA: dict[date, dict[str, float]] = {
-    date(2026, 9, 2): {
-        "Espetto": 42_408.90,
-        "Mane": 12_117.12,
-        "Sirene": 6_058.80,
-    },
-    date(2026, 9, 4): {
-        "Espetto": 524_677.14,
-        "Mane": 149_913.47,
-        "Sirene": 74_956.87,
-    },
-    date(2026, 9, 5): {
-        "Espetto": 511_774.54,
-        "Mane": 146_221.44,
-        "Sirene": 73_109.22,
-    },
-    date(2026, 9, 6): {
-        "Espetto": 542_734.54,
-        "Mane": 155_067.01,
-        "Sirene": 77_533.51,
-    },
-    date(2026, 9, 7): {
-        "Espetto": 457_050.32,
-        "Mane": 130_585.87,
-        "Sirene": 65_292.82,
-    },
-    date(2026, 9, 11): {
-        "Espetto": 648_317.47,
-        "Mane": 185_233.56,
-        "Sirene": 92_616.78,
-    },
-    date(2026, 9, 12): {
-        "Espetto": 551_836.14,
-        "Mane": 157_671.18,
-        "Sirene": 78_830.58,
-    },
-    date(2026, 9, 13): {
-        "Espetto": 543_228.85,
-        "Mane": 155_207.22,
-        "Sirene": 77_603.62,
-    },
+# Soft opening — metas fixas do primeiro dia oficial
+DIA_ABERTURA = date(2026, 9, 2)
+META_FIXA_ABERTURA: dict[str, float] = {
+    "Espetto": 42_409.93,
+    "Mane": 12_117.12,
+    "Sirene": 6_058.56,
 }
-
-META_POR_DIA_TOTAL: dict[date, float] = {
-    d: round(sum(vals.values()), 2) for d, vals in META_POR_DIA_MARCA.items()
-}
-
-
-def meta_marca_dia(dia: date, marca: str) -> float:
-    por_marca = META_POR_DIA_MARCA.get(dia)
-    if por_marca and marca in por_marca:
-        return float(por_marca[marca])
-    total = META_POR_DIA_TOTAL.get(dia, 0.0)
-    return round(total * RATEIO_MARCA.get(marca, 0.0), 2)
 
 
 def meta_marca_evento(marca: str) -> float:
@@ -98,6 +49,92 @@ def agregar_realizado_por_marca(produtos: list[ItemValor]) -> dict[str, float]:
     for m, pct in RATEIO_MARCA.items():
         buckets[m] += bebidas * pct
     return {m: round(buckets[m], 2) for m in MARCAS}
+
+
+def _inicio_janela(d: date) -> datetime:
+    return datetime(d.year, d.month, d.day, 12, 0, tzinfo=TZ)
+
+
+def _dia_ja_iniciou(d: date, agora: datetime) -> bool:
+    return agora >= _inicio_janela(d)
+
+
+def _acumulado_antes(
+    dia: date,
+    realizados_por_dia: dict[date, dict[str, float]],
+    agora: datetime,
+) -> dict[str, float]:
+    """Soma o realizado das marcas nos dias oficiais anteriores a `dia` que já começaram."""
+    acum = {m: 0.0 for m in MARCAS}
+    for d in DIAS_OFICIAIS:
+        if d >= dia:
+            break
+        if not _dia_ja_iniciou(d, agora):
+            continue
+        real = realizados_por_dia.get(d, {})
+        for m in MARCAS:
+            acum[m] += float(real.get(m, 0.0))
+    return {m: round(acum[m], 2) for m in MARCAS}
+
+
+def calcular_metas_por_dia(
+    realizados_por_dia: dict[date, dict[str, float]],
+    agora: datetime | None = None,
+) -> dict[date, dict[str, float]]:
+    """
+    02/09: metas fixas de abertura.
+    Demais dias: (meta_marca − realizado acumulado anterior) / dias restantes
+    (incluindo o próprio dia).
+
+    Dias futuros ainda não iniciados compartilham o mesmo rateio igual do saldo
+    restante à época do primeiro dia futuro.
+    """
+    agora = agora or datetime.now(TZ)
+    if agora.tzinfo is None:
+        agora = agora.replace(tzinfo=TZ)
+    else:
+        agora = agora.astimezone(TZ)
+
+    metas: dict[date, dict[str, float]] = {
+        DIA_ABERTURA: {m: float(META_FIXA_ABERTURA[m]) for m in MARCAS}
+    }
+
+    for i, d in enumerate(DIAS_OFICIAIS):
+        if d == DIA_ABERTURA:
+            continue
+
+        acum = _acumulado_antes(d, realizados_por_dia, agora)
+        n_restantes = len(DIAS_OFICIAIS) - i
+        if n_restantes <= 0:
+            continue
+
+        meta_dia = {
+            m: round((meta_marca_evento(m) - acum[m]) / n_restantes, 2)
+            for m in MARCAS
+        }
+
+        if not _dia_ja_iniciou(d, agora):
+            # Congela o mesmo valor para todos os dias futuros restantes.
+            for d_fut in DIAS_OFICIAIS[i:]:
+                metas[d_fut] = dict(meta_dia)
+            break
+
+        metas[d] = meta_dia
+
+    return metas
+
+
+def meta_marca_dia(
+    dia: date,
+    marca: str,
+    realizados_por_dia: dict[date, dict[str, float]] | None = None,
+    agora: datetime | None = None,
+) -> float:
+    """Compat: devolve a meta dinâmica (ou a fixa do dia 02/09)."""
+    if dia == DIA_ABERTURA:
+        return float(META_FIXA_ABERTURA.get(marca, 0.0))
+    mapa = calcular_metas_por_dia(realizados_por_dia or {}, agora=agora)
+    return float(mapa.get(dia, {}).get(marca, 0.0))
 
 
 @dataclass
@@ -135,23 +172,24 @@ def montar_linhas_meta(
     else:
         agora = agora.astimezone(TZ)
 
+    metas = calcular_metas_por_dia(realizados_por_dia, agora=agora)
     linhas: list[LinhaMetaDia] = []
     for d in DIAS_OFICIAIS:
-        inicio_janela = datetime(d.year, d.month, d.day, 12, 0, tzinfo=TZ)
-        ocorreu = agora >= inicio_janela
-        meta_total = META_POR_DIA_TOTAL.get(d, 0.0)
+        ocorreu = _dia_ja_iniciou(d, agora)
+        meta_marcas = metas.get(d, {m: 0.0 for m in MARCAS})
+        meta_total = round(sum(meta_marcas.values()), 2)
         celulas: dict[str, CelulaMeta] = {}
 
         if not ocorreu:
             for m in MARCAS:
-                celulas[m] = CelulaMeta(realizado=None, meta=meta_marca_dia(d, m))
+                celulas[m] = CelulaMeta(realizado=None, meta=float(meta_marcas.get(m, 0.0)))
             total = CelulaMeta(realizado=None, meta=meta_total)
         else:
             real = realizados_por_dia.get(d, {})
             for m in MARCAS:
                 celulas[m] = CelulaMeta(
                     realizado=float(real.get(m, 0.0)),
-                    meta=meta_marca_dia(d, m),
+                    meta=float(meta_marcas.get(m, 0.0)),
                 )
             tot_real = sum(celulas[m].realizado or 0.0 for m in MARCAS)
             total = CelulaMeta(realizado=round(tot_real, 2), meta=meta_total)
