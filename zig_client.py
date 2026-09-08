@@ -606,6 +606,7 @@ def parse_faturamento_resumo_evento(html: str) -> float:
 
 
 NOME_RETIRADA_PRODUTO = "Retirada de produto"
+ZIG_CLIENT_API = 2
 
 
 def parse_formas_pagamento(html: str) -> list[ItemValor]:

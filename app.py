@@ -24,9 +24,20 @@ from zig_client import (
     SaidaHorariaPonto,
     ZigClient,
     janela_operacional,
-    mesclar_retirada_produto,
     produtos_por_marca,
 )
+try:
+    from zig_client import mesclar_retirada_produto
+except ImportError:  # Cloud pode subir app.py antes do zig_client novo
+    def mesclar_retirada_produto(
+        formas: list[ItemValor], valor_retirada: float
+    ) -> list[ItemValor]:
+        if valor_retirada <= 0:
+            return list(formas)
+        out = [i for i in formas if "retirada" not in i.nome.lower()]
+        out.append(ItemValor(nome="Retirada de produto", total=valor_retirada))
+        out.sort(key=lambda x: x.total, reverse=True)
+        return out
 from meta_marcas import (
     META_EVENTO,
     META_VERSAO,
@@ -134,11 +145,15 @@ def carregar_historico_metas(
 
 @st.cache_data(ttl=SAIDA_HORARIA_TTL_SECONDS, show_spinner=False)
 def carregar_saida_horaria(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 11
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 12
 ):
     """Janela operacional atual; saída por intervalo de 30 min (não acumulada)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
-    return client.fetch_saida_horaria()
+    result = client.fetch_saida_horaria()
+    if len(result) == 3:
+        periodo, horas, saidas = result
+        return periodo, horas, saidas, 0.0
+    return result
 
 
 def _bar_ranking(df: pd.DataFrame, y_col: str, chart_key: str, height_row: int = 44) -> None:
@@ -741,7 +756,7 @@ def main() -> None:
     with st.spinner("Carregando saída horária e formas de pagamento..."):
         try:
             periodo_saida, _horas, saidas_atual, retirada_atual = carregar_saida_horaria(
-                cfg["login"], cfg["password"], cfg["evento_id"], saida_bucket, 11
+                cfg["login"], cfg["password"], cfg["evento_id"], saida_bucket, 12
             )
             formas_atual = mesclar_retirada_produto(formas_atual, retirada_atual)
         except Exception as exc:  # noqa: BLE001
