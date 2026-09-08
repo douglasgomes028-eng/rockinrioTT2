@@ -385,6 +385,8 @@ def _count_lista_transacao_rows(html: str) -> int:
 LISTA_TRANSACAO_ROW_SOFT_LIMIT = 145
 LISTA_TRANSACAO_MIN_SPAN = timedelta(minutes=1)
 LISTA_TRANSACAO_BASE_MINUTES = 5
+# Limite mais agressivo só para somar Retirada (tipo=0).
+LISTA_RETIRADA_ROW_SOFT_LIMIT = 90
 
 
 def iter_fatias_minutos(
@@ -603,6 +605,9 @@ def parse_faturamento_resumo_evento(html: str) -> float:
     return 0.0
 
 
+NOME_RETIRADA_PRODUTO = "Retirada de produto"
+
+
 def parse_formas_pagamento(html: str) -> list[ItemValor]:
     """Linhas de forma de pagamento no Resumo Financeiro (antes de Total Devoluções)."""
     soup = _soup(html)
@@ -636,6 +641,56 @@ def parse_formas_pagamento(html: str) -> list[ItemValor]:
             items.append(ItemValor(nome=nome, total=valor))
     items.sort(key=lambda x: x.total, reverse=True)
     return items
+
+
+def somar_retirada_produto_lista(html: str) -> float:
+    """
+    Soma o Valor das linhas 'Retirada de Produto' na Lista de Transações.
+
+    No Resumo Financeiro essa operação não entra como forma de pagamento
+    (Forma fica vazia); no gráfico de mix tratamos como fatia própria.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return 0.0
+    rows = table.find_all("tr")
+    if len(rows) < 2:
+        return 0.0
+    header = [c.get_text(" ", strip=True) for c in rows[0].find_all(["th", "td"])]
+    i_op = _find_col(header, "Operação", "Operacao")
+    i_val = _find_col(header, "Valor")
+    if i_op is None or i_val is None:
+        return 0.0
+    total = 0.0
+    for tr in rows[1:]:
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+        if i_op >= len(cells) or i_val >= len(cells):
+            continue
+        if "retirada" not in cells[i_op].lower():
+            continue
+        total += _parse_br_number(cells[i_val])
+    return total
+
+
+def mesclar_retirada_produto(
+    formas: list[ItemValor], valor_retirada: float
+) -> list[ItemValor]:
+    """Inclui/atualiza a fatia 'Retirada de produto' e reordena por valor."""
+    if valor_retirada <= 0:
+        return list(formas)
+    out: list[ItemValor] = []
+    found = False
+    for item in formas:
+        if "retirada" in item.nome.lower():
+            out.append(ItemValor(nome=NOME_RETIRADA_PRODUTO, total=valor_retirada))
+            found = True
+        else:
+            out.append(item)
+    if not found:
+        out.append(ItemValor(nome=NOME_RETIRADA_PRODUTO, total=valor_retirada))
+    out.sort(key=lambda x: x.total, reverse=True)
+    return out
 
 
 def parse_produtos_vendidos(html: str) -> list[ItemValor]:
@@ -960,14 +1015,16 @@ class ZigClient:
 
     def _fetch_lista_eventos_periodo(
         self, inicio: datetime, fim: datetime
-    ) -> list[tuple[datetime, str, str, int, str]]:
+    ) -> tuple[list[tuple[datetime, str, str, int, str]], float]:
         """
         Lista de Transações com bisect quando o HTML parece truncado.
+
+        Retorna (eventos, valor_retirada_produto).
         """
         inicio = _aware(inicio)
         fim = _aware(fim)
         if fim <= inicio:
-            return []
+            return [], 0.0
         try:
             html = self.process_report(
                 "lista_transacao",
@@ -977,7 +1034,7 @@ class ZigClient:
                 ],
             )
         except Exception:
-            return []
+            return [], 0.0
 
         n_rows = _count_lista_transacao_rows(html)
         span = fim - inicio
@@ -987,12 +1044,76 @@ class ZigClient:
         ):
             mid = inicio + timedelta(seconds=int(span.total_seconds() // 2))
             if mid <= inicio or mid >= fim:
-                return extrair_eventos_lista_transacao(html)
-            return self._fetch_lista_eventos_periodo(
-                inicio, mid
-            ) + self._fetch_lista_eventos_periodo(mid, fim)
+                return (
+                    extrair_eventos_lista_transacao(html),
+                    somar_retirada_produto_lista(html),
+                )
+            e1, r1 = self._fetch_lista_eventos_periodo(inicio, mid)
+            e2, r2 = self._fetch_lista_eventos_periodo(mid, fim)
+            return e1 + e2, r1 + r2
 
-        return extrair_eventos_lista_transacao(html)
+        return (
+            extrair_eventos_lista_transacao(html),
+            somar_retirada_produto_lista(html),
+        )
+
+    def _somar_retirada_produto_periodo(self, inicio: datetime, fim: datetime) -> float:
+        """
+        Total de 'Retirada de Produto' na janela, com bisect anti-truncamento.
+
+        Usa o relatório resumido (tipo=0): menos HTML que o detalhado de produtos.
+        """
+        inicio = _aware(inicio)
+        fim = _aware(fim)
+        if fim <= inicio:
+            return 0.0
+        try:
+            html = self.process_report(
+                "lista_transacao",
+                [
+                    f"field-periodo={_fmt_periodo(inicio, fim)}",
+                    "field-tipo-relatorio-transacao=0",
+                ],
+            )
+        except Exception:
+            return 0.0
+
+        n_rows = _count_lista_transacao_rows(html)
+        span = fim - inicio
+        if (
+            n_rows >= LISTA_RETIRADA_ROW_SOFT_LIMIT
+            and span > LISTA_TRANSACAO_MIN_SPAN
+        ):
+            mid = inicio + timedelta(seconds=int(span.total_seconds() // 2))
+            if mid <= inicio or mid >= fim:
+                return somar_retirada_produto_lista(html)
+            return self._somar_retirada_produto_periodo(
+                inicio, mid
+            ) + self._somar_retirada_produto_periodo(mid, fim)
+        return somar_retirada_produto_lista(html)
+
+    def fetch_retirada_produto_total(
+        self,
+        inicio: datetime | None = None,
+        fim: datetime | None = None,
+        *,
+        ensure_login: bool = True,
+    ) -> float:
+        """Soma Retirada de produto na janela (fatias de 1h + bisect)."""
+        agora = _aware(datetime.now(TZ))
+        if inicio is None or fim is None:
+            dia_ini, dia_fim = janela_operacional(agora)
+        else:
+            dia_ini, dia_fim = _aware(inicio), _aware(fim)
+        if ensure_login:
+            self.login_session()
+        total = 0.0
+        cursor = dia_ini
+        while cursor < dia_fim:
+            nxt = min(cursor + timedelta(hours=1), dia_fim)
+            total += self._somar_retirada_produto_periodo(cursor, nxt)
+            cursor = nxt
+        return total
 
     def fetch_saida_horaria(
         self,
@@ -1001,13 +1122,15 @@ class ZigClient:
         fim: datetime | None = None,
         *,
         ensure_login: bool = True,
-    ) -> tuple[str, list[str], list[SaidaHorariaPonto]]:
+    ) -> tuple[str, list[str], list[SaidaHorariaPonto], float]:
         """
         Saída por intervalo de 30 min por produto/ponto na janela 12:00–07:00.
 
         Cada coluna é a quantidade daquele intervalo (0 se não houve movimento).
         Busca a Lista de Transações em fatias de 5 min, com subdivisão automática
         quando o HTML da Zig trunca (~150 linhas).
+
+        Também devolve o total de Retirada de produto (mesmo HTML).
         """
         agora = _aware(agora or datetime.now(TZ))
         if inicio is None or fim is None:
@@ -1022,15 +1145,18 @@ class ZigClient:
             self.login_session()
 
         if not labels:
-            return periodo_label, [], montar_saida_horaria_vazia([])
+            return periodo_label, [], montar_saida_horaria_vazia([]), 0.0
 
         bruto: list[tuple[datetime, str, str, int, str]] = []
+        retirada = 0.0
         for f_ini, f_fim in iter_fatias_minutos(dia_ini, dia_fim):
-            bruto.extend(self._fetch_lista_eventos_periodo(f_ini, f_fim))
+            eventos, ret = self._fetch_lista_eventos_periodo(f_ini, f_fim)
+            bruto.extend(eventos)
+            retirada += ret
 
         eventos = _dedupe_eventos(bruto)
         saidas = montar_saida_por_intervalo(eventos, dia_ini, dia_fim)
-        return periodo_label, labels, saidas
+        return periodo_label, labels, saidas, retirada
 
     def fetch_historico(
         self,
@@ -1047,12 +1173,15 @@ class ZigClient:
             dia = self._metricas_periodo(ini, fim)
             if incluir_saida_horaria and not dia.erro:
                 try:
-                    _periodo, _horas, saidas = self.fetch_saida_horaria(
+                    _periodo, _horas, saidas, retirada = self.fetch_saida_horaria(
                         inicio=ini,
                         fim=fim,
                         ensure_login=False,
                     )
                     dia.saidas_horarias = saidas
+                    dia.formas_pagamento = mesclar_retirada_produto(
+                        dia.formas_pagamento, retirada
+                    )
                 except Exception:
                     dia.saidas_horarias = []
             historico.append(dia)

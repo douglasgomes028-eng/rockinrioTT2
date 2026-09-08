@@ -18,23 +18,62 @@ RATEIO_MARCA: dict[str, float] = {
     "Sirene": 0.10,
 }
 
-# Meta TOTAL por dia oficial — curva do anexo de referência (não é total÷8).
-# Marcas = total_dia × RATEIO_MARCA (70/20/10).
-META_VERSAO = "curva-anexo-3"
+# Metas do print de referência (anexo original), já no rateio 70/20/10.
+# Ex.: 06/09 Sirene = R$ 77.533,51 (10% de R$ 775.335,06).
+META_VERSAO = "print-anexo-4"
+
+META_POR_DIA_MARCA: dict[date, dict[str, float]] = {
+    date(2026, 9, 2): {
+        "Espetto": 42_408.90,
+        "Mane": 12_117.12,
+        "Sirene": 6_058.80,
+    },
+    date(2026, 9, 4): {
+        "Espetto": 524_677.14,
+        "Mane": 149_913.47,
+        "Sirene": 74_956.87,
+    },
+    date(2026, 9, 5): {
+        "Espetto": 511_774.54,
+        "Mane": 146_221.44,
+        "Sirene": 73_109.22,
+    },
+    date(2026, 9, 6): {
+        "Espetto": 542_734.54,
+        "Mane": 155_067.01,
+        "Sirene": 77_533.51,
+    },
+    date(2026, 9, 7): {
+        "Espetto": 457_050.32,
+        "Mane": 130_585.87,
+        "Sirene": 65_292.82,
+    },
+    date(2026, 9, 11): {
+        "Espetto": 648_317.47,
+        "Mane": 185_233.56,
+        "Sirene": 92_616.78,
+    },
+    date(2026, 9, 12): {
+        "Espetto": 551_836.14,
+        "Mane": 157_671.18,
+        "Sirene": 78_830.58,
+    },
+    date(2026, 9, 13): {
+        "Espetto": 543_228.85,
+        "Mane": 155_207.22,
+        "Sirene": 77_603.62,
+    },
+}
 
 META_POR_DIA_TOTAL: dict[date, float] = {
-    date(2026, 9, 2): 60_606.21,
-    date(2026, 9, 4): 748_896.22,
-    date(2026, 9, 5): 644_674.20,
-    date(2026, 9, 6): 810_203.70,
-    date(2026, 9, 7): 895_808.33,
-    date(2026, 9, 11): 851_843.68,
-    date(2026, 9, 12): 741_945.16,
-    date(2026, 9, 13): 721_509.46,
+    d: round(sum(vals.values()), 2) for d, vals in META_POR_DIA_MARCA.items()
 }
 
 
 def meta_marca_dia(dia: date, marca: str) -> float:
+    por_marca = META_POR_DIA_MARCA.get(dia)
+    if por_marca and marca in por_marca:
+        return float(por_marca[marca])
     total = META_POR_DIA_TOTAL.get(dia, 0.0)
     return round(total * RATEIO_MARCA.get(marca, 0.0), 2)
 

@@ -24,6 +24,7 @@ from zig_client import (
     SaidaHorariaPonto,
     ZigClient,
     janela_operacional,
+    mesclar_retirada_produto,
     produtos_por_marca,
 )
 from meta_marcas import (
@@ -48,6 +49,31 @@ HISTORICO_TTL_SECONDS = 30 * 60
 SAIDA_HORARIA_TTL_SECONDS = 15 * 60
 
 CORES_PAGAMENTO = [COR_AZUL, COR_VERDE, COR_LARANJA, COR_ROSA, "#775DD0", "#546E7A"]
+CORES_PAGAMENTO_POR_NOME = {
+    "cartao credito": COR_AZUL,
+    "cartao debito": COR_VERDE,
+    "pix integrado": COR_LARANJA,
+    "retirada de produto": COR_ROSA,
+    "zig cashless": "#775DD0",
+}
+
+
+def _cores_formas(formas: list[ItemValor]) -> list[str]:
+    cores: list[str] = []
+    fallback = 0
+    for item in formas:
+        chave = (
+            item.nome.lower()
+            .replace("ç", "c")
+            .replace("ã", "a")
+            .replace("á", "a")
+        )
+        cor = CORES_PAGAMENTO_POR_NOME.get(chave)
+        if cor is None:
+            cor = CORES_PAGAMENTO[min(fallback, len(CORES_PAGAMENTO) - 1)]
+            fallback += 1
+        cores.append(cor)
+    return cores
 
 
 def _money(v: float) -> str:
@@ -87,7 +113,7 @@ def carregar_snapshot(
 
 @st.cache_data(ttl=HISTORICO_TTL_SECONDS, show_spinner=False)
 def carregar_historico(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 10
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 11
 ):
     """_cache_ver invalida caches antigos (saída sem truncamento HTML)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
@@ -96,7 +122,7 @@ def carregar_historico(
 
 @st.cache_data(ttl=HISTORICO_TTL_SECONDS, show_spinner=False)
 def carregar_historico_metas(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 3
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 4
 ):
     """Histórico só com métricas/produtos (sem saída horária) para a grade de metas."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
@@ -108,7 +134,7 @@ def carregar_historico_metas(
 
 @st.cache_data(ttl=SAIDA_HORARIA_TTL_SECONDS, show_spinner=False)
 def carregar_saida_horaria(
-    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 10
+    login: str, password: str, evento_id: int, _bucket: int, _cache_ver: int = 11
 ):
     """Janela operacional atual; saída por intervalo de 30 min (não acumulada)."""
     client = ZigClient(login=login, password=password, evento_id=evento_id)
@@ -322,7 +348,7 @@ def _render_mix_charts(
             formas,
             "Forma de pagamento",
             "faturamento por forma",
-            CORES_PAGAMENTO,
+            _cores_formas(formas),
             f"{key_prefix}_pagto",
         )
     with c3:
@@ -550,7 +576,7 @@ def _render_meta_por_marca(
     st.caption(
         f"meta do evento **{_money(META_EVENTO)}** · realizado **{pct_txt}** · "
         "bebidas rateadas **70% Espetto / 20% Mané / 10% Sirene** · "
-        f"versão metas **{META_VERSAO}** (02/09 Espetto ≈ R$ 42.424)"
+        f"versão metas **{META_VERSAO}** (06/09 Sirene = R$ 77.533,51)"
     )
 
     headers = ["DIA", "ESPETTO", "MANÉ", "SIRENE", "TOTAL"]
@@ -707,9 +733,23 @@ def main() -> None:
         _render_pontos(snap.pontos, chart_key="pontos_atual")
 
     _render_produtos_por_marca(snap.produtos, key_prefix="prod_atual")
+
+    formas_atual = list(snap.formas_pagamento)
+    saida_bucket = int(agora.timestamp() // SAIDA_HORARIA_TTL_SECONDS)
+    saidas_atual: list[SaidaHorariaPonto] = []
+    periodo_saida = snap.periodo_dia or ""
+    with st.spinner("Carregando saída horária e formas de pagamento..."):
+        try:
+            periodo_saida, _horas, saidas_atual, retirada_atual = carregar_saida_horaria(
+                cfg["login"], cfg["password"], cfg["evento_id"], saida_bucket, 11
+            )
+            formas_atual = mesclar_retirada_produto(formas_atual, retirada_atual)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Não foi possível carregar a saída horária agora: {exc}")
+
     _render_mix_charts(
         snap.palcos,
-        snap.formas_pagamento,
+        formas_atual,
         snap.categorias,
         key_prefix="mix_atual",
     )
@@ -717,22 +757,14 @@ def main() -> None:
     with st.spinner("Carregando metas por marca..."):
         try:
             hist_metas = carregar_historico_metas(
-                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 3
+                cfg["login"], cfg["password"], cfg["evento_id"], hist_bucket, 4
             )
         except Exception as exc:  # noqa: BLE001
             hist_metas = []
             st.warning(f"Não foi possível carregar metas por marca agora: {exc}")
     _render_meta_por_marca(snap.produtos, hist_metas, dia_ini, agora)
 
-    saida_bucket = int(agora.timestamp() // SAIDA_HORARIA_TTL_SECONDS)
-    with st.spinner("Carregando saída horária na janela operacional..."):
-        try:
-            periodo_saida, _horas, saidas = carregar_saida_horaria(
-                cfg["login"], cfg["password"], cfg["evento_id"], saida_bucket, 10
-            )
-            _render_saida_horaria(periodo_saida, saidas)
-        except Exception as exc:  # noqa: BLE001
-            st.warning(f"Não foi possível carregar a saída horária agora: {exc}")
+    _render_saida_horaria(periodo_saida, saidas_atual)
 
     with st.spinner("Carregando dias oficiais anteriores..."):
         try:
