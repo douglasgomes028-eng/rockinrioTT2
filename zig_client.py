@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import re
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -212,6 +216,37 @@ def listar_janelas_anteriores(
 
 def label_janela(inicio: datetime, fim: datetime) -> str:
     return f"{inicio.strftime('%d/%m/%Y')} 12:00 - {fim.strftime('%d/%m/%Y')} 07:00"
+
+
+def listar_janelas_xml(
+    agora: datetime | None = None,
+) -> list[tuple[datetime, datetime]]:
+    """Janelas oficiais 12:00–07:00 já iniciadas (mais recentes primeiro)."""
+    agora = _aware(agora or datetime.now(TZ))
+    janelas: list[tuple[datetime, datetime]] = []
+    for dia in DIAS_OFICIAIS:
+        inicio = datetime(dia.year, dia.month, dia.day, 12, 0, tzinfo=TZ)
+        fim = (inicio + timedelta(days=1)).replace(
+            hour=7, minute=0, second=0, microsecond=0
+        )
+        if inicio <= agora:
+            janelas.append((inicio, fim))
+    janelas.sort(key=lambda x: x[0], reverse=True)
+    return janelas
+
+
+@dataclass
+class NotaFiscalXml:
+    """Resumo de NF com caminho do XML (Gestão de Notas)."""
+
+    nota_id: int
+    transacao_id: str
+    numero: str
+    serie: str
+    status: str
+    caminho_xml: str
+    data_transacao: str
+    valor_total: float = 0.0
 
 
 def palco_do_ponto(nome: str) -> str:
@@ -1247,3 +1282,168 @@ class ZigClient:
                 periodo_dia=periodo_dia,
                 erro=str(exc),
             )
+
+    def _filtrar_gestao_notas(
+        self, inicio: datetime, fim: datetime, *, status_nf: int = 0
+    ) -> int:
+        """
+        Aplica filtro na Gestão de Notas (sessão) e retorna total de itens.
+        status_nf: 0=emitidas, 1=rejeitadas, 2=todas, 3=em processamento.
+        """
+        self.session.post(
+            f"{BASE}/Gestao/AjaxPartialLoader",
+            data={
+                "filter": "GestaoNotaFiscalFilter",
+                "content": "GestaoNotaFiscalGrid",
+            },
+            timeout=60,
+        )
+        periodo = _fmt_periodo(inicio, fim)
+        r = self.session.post(
+            f"{BASE}/Gestao/GestaoNotaFiscalGrid",
+            data={
+                "evento": str(self.evento_id),
+                "intCodigoCliente": str(self.evento_id),
+                "vchPeriodo": periodo,
+                "tnyStatusNF": str(status_nf),
+                "tnyExibeResumoErro": "2",
+            },
+            timeout=180,
+        )
+        r.raise_for_status()
+        m = re.search(r"totalItens\s*=\s*'(\d+)'", r.text)
+        return int(m.group(1)) if m else 0
+
+    def listar_notas_fiscais_xml(
+        self,
+        inicio: datetime,
+        fim: datetime,
+        *,
+        status_nf: int = 0,
+        max_paginas: int | None = None,
+    ) -> tuple[list[NotaFiscalXml], int]:
+        """
+        Lista NFs emitidas no período com URL do XML (paginação da Gestão de Notas).
+        Retorna (notas_com_xml, total_informado_pelo_servidor).
+        """
+        self.login_session()
+        total = self._filtrar_gestao_notas(inicio, fim, status_nf=status_nf)
+        if total <= 0:
+            return [], 0
+
+        por_id: dict[int, NotaFiscalXml] = {}
+        pagina = 0
+        while True:
+            if max_paginas is not None and pagina >= max_paginas:
+                break
+            pr = self.session.post(
+                f"{BASE}/Gestao/GetNotasFiscaisPagina",
+                data={"index": pagina},
+                timeout=180,
+            )
+            pr.raise_for_status()
+            payload = pr.json()
+            if payload.get("error"):
+                raise RuntimeError(str(payload["error"]))
+            rows = payload.get("data") or []
+            if not rows:
+                break
+            for row in rows:
+                caminho = (row.get("vchCaminhoXml") or "").strip()
+                if not caminho:
+                    continue
+                nota_id = int(row.get("NotaFiscal_ID") or 0)
+                if nota_id <= 0 or nota_id in por_id:
+                    continue
+                por_id[nota_id] = NotaFiscalXml(
+                    nota_id=nota_id,
+                    transacao_id=str(row.get("Transacao_ID") or ""),
+                    numero=str(row.get("Numero") or ""),
+                    serie=str(row.get("Serie") or ""),
+                    status=str(row.get("Status") or ""),
+                    caminho_xml=caminho,
+                    data_transacao=str(row.get("_DataHoraTransacao") or ""),
+                    valor_total=float(row.get("numValorTotal") or 0),
+                )
+            pagina += 1
+            items_per_page = int(payload.get("itemsPerPage") or len(rows) or 150)
+            if pagina * items_per_page >= total:
+                break
+
+        notas = sorted(por_id.values(), key=lambda n: n.nota_id)
+        return notas, total
+
+    def montar_zip_xmls(
+        self,
+        notas: list[NotaFiscalXml],
+        *,
+        max_workers: int = 16,
+    ) -> tuple[bytes, int, int]:
+        """
+        Baixa XMLs em paralelo e monta um ZIP em memória.
+        Retorna (zip_bytes, ok_count, fail_count).
+        """
+        if not notas:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w"):
+                pass
+            return buf.getvalue(), 0, 0
+
+        def _nome_arquivo(nota: NotaFiscalXml) -> str:
+            path = urlparse(nota.caminho_xml).path
+            base = path.rsplit("/", 1)[-1] if path else ""
+            if base.lower().endswith(".xml"):
+                return base
+            num = nota.numero or "s_numero"
+            return f"NF_{num}_{nota.nota_id}.xml"
+
+        def _baixar(nota: NotaFiscalXml) -> tuple[str, bytes | None]:
+            url = nota.caminho_xml
+            if url.startswith("/"):
+                url = "https://netpdv.com" + url
+            try:
+                # URLs Focus NFe são públicas; sessão Zig não é thread-safe
+                resp = requests.get(url, timeout=60)
+                if resp.status_code != 200 or not resp.content:
+                    return _nome_arquivo(nota), None
+                return _nome_arquivo(nota), resp.content
+            except Exception:  # noqa: BLE001
+                return _nome_arquivo(nota), None
+
+        ok = 0
+        fail = 0
+        buf = io.BytesIO()
+        used_names: set[str] = set()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_baixar, n): n for n in notas}
+                for fut in as_completed(futures):
+                    nome, content = fut.result()
+                    if content is None:
+                        fail += 1
+                        continue
+                    final = nome
+                    if final in used_names:
+                        stem = final[:-4] if final.lower().endswith(".xml") else final
+                        final = f"{stem}_{futures[fut].nota_id}.xml"
+                    used_names.add(final)
+                    zf.writestr(final, content)
+                    ok += 1
+        return buf.getvalue(), ok, fail
+
+    def baixar_zip_xmls_periodo(
+        self,
+        inicio: datetime,
+        fim: datetime,
+        *,
+        status_nf: int = 0,
+    ) -> tuple[bytes, int, int, int]:
+        """
+        Lista NFs do período e gera ZIP com XMLs.
+        Retorna (zip_bytes, total_listadas, xml_ok, xml_fail).
+        """
+        notas, _total = self.listar_notas_fiscais_xml(
+            inicio, fim, status_nf=status_nf
+        )
+        zip_bytes, ok, fail = self.montar_zip_xmls(notas)
+        return zip_bytes, len(notas), ok, fail

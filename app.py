@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import plotly.express as px
@@ -24,6 +24,8 @@ from zig_client import (
     SaidaHorariaPonto,
     ZigClient,
     janela_operacional,
+    label_janela,
+    listar_janelas_xml,
     produtos_por_marca,
 )
 try:
@@ -52,7 +54,7 @@ st.set_page_config(
     page_title="Impettus | RIR26 Vendas",
     page_icon="R",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 REFRESH_SECONDS = 60
@@ -154,6 +156,95 @@ def carregar_saida_horaria(
         periodo, horas, saidas = result
         return periodo, horas, saidas, 0.0
     return result
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def gerar_zip_xml_dia(
+    login: str,
+    password: str,
+    evento_id: int,
+    dia_iso: str,
+    _cache_ver: int = 1,
+) -> tuple[bytes, int, int, int, str]:
+    """
+    Gera ZIP com XMLs de NF do dia operacional (12:00–07:00).
+    Retorna (zip_bytes, qtd_listadas, ok, fail, label).
+    """
+    dia = date.fromisoformat(dia_iso)
+    inicio = datetime(dia.year, dia.month, dia.day, 12, 0, tzinfo=TZ)
+    fim = (inicio + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)
+    label = label_janela(inicio, fim)
+    client = ZigClient(login=login, password=password, evento_id=evento_id)
+    zip_bytes, listadas, ok, fail = client.baixar_zip_xmls_periodo(inicio, fim)
+    return zip_bytes, listadas, ok, fail, label
+
+
+def _render_download_xml(cfg: dict) -> None:
+    st.title("Download de XML — Notas Fiscais")
+    st.caption(
+        "Consolidação dos XMLs de NF-e por dia operacional (12:00–07:00). "
+        "Expanda a data e gere o ZIP para download."
+    )
+
+    janelas = listar_janelas_xml()
+    if not janelas:
+        st.info("Nenhum dia operacional iniciado ainda.")
+        return
+
+    st.markdown(f"**{len(janelas)}** dia(s) disponível(is) para download.")
+
+    for inicio, fim in janelas:
+        dia_iso = inicio.date().isoformat()
+        titulo = label_janela(inicio, fim)
+        with st.expander(titulo, expanded=False):
+            st.write(
+                f"Período Zig: `{inicio.strftime('%d/%m/%Y %H:%M')} - "
+                f"{fim.strftime('%d/%m/%Y %H:%M')}`"
+            )
+            st.caption(
+                "O arquivo ZIP inclui apenas notas emitidas com XML disponível "
+                "(Focus NFe). Dias com alto volume podem levar alguns minutos."
+            )
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                gerar = st.button(
+                    "Gerar ZIP",
+                    key=f"xml_gerar_{dia_iso}",
+                    type="primary",
+                )
+            if gerar:
+                st.session_state[f"xml_ready_{dia_iso}"] = True
+
+            if st.session_state.get(f"xml_ready_{dia_iso}"):
+                with st.spinner(f"Listando NFs e baixando XMLs de {titulo}..."):
+                    try:
+                        zip_bytes, listadas, ok, fail, _lbl = gerar_zip_xml_dia(
+                            cfg["login"],
+                            cfg["password"],
+                            cfg["evento_id"],
+                            dia_iso,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"Falha ao gerar o ZIP: {exc}")
+                        st.session_state[f"xml_ready_{dia_iso}"] = False
+                        continue
+                st.success(
+                    f"{ok} XML(s) no ZIP"
+                    + (f" · {fail} falha(s)" if fail else "")
+                    + f" · {listadas} nota(s) com XML na listagem"
+                )
+                if ok <= 0:
+                    st.warning("Nenhum XML disponível para este dia.")
+                    continue
+                nome_arquivo = f"xml_nf_{dia_iso.replace('-', '')}.zip"
+                st.download_button(
+                    label="Baixar ZIP",
+                    data=zip_bytes,
+                    file_name=nome_arquivo,
+                    mime="application/zip",
+                    key=f"xml_dl_{dia_iso}",
+                    type="primary",
+                )
 
 
 def _bar_ranking(df: pd.DataFrame, y_col: str, chart_key: str, height_row: int = 44) -> None:
@@ -658,36 +749,9 @@ def _render_meta_por_marca(
     )
 
 
-def main() -> None:
-    st.markdown(
-        """
-        <style>
-        .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
-        div[data-testid="stMetricValue"] { font-size: 1.6rem; }
-        div[data-testid="stVerticalBlockBorderWrapper"] {
-            background: rgba(255,255,255,0.02);
-            border-radius: 12px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
+def _render_dashboard(cfg: dict) -> None:
     st.title("Grupo Impettus — Rock In Rio 26")
     st.caption("Dashboard de vendas em tempo quase real (atualização a cada 1 minuto)")
-
-    try:
-        cfg = _load_secrets()
-    except Exception:
-        st.error(
-            "Configure os secrets no Streamlit Cloud (ou em `.streamlit/secrets.toml`). "
-            "Veja `secrets.toml.example`."
-        )
-        st.stop()
-
-    if not cfg["login"] or not cfg["password"]:
-        st.error("Secrets incompletos: informe `zig.login` e `zig.password`.")
-        st.stop()
 
     agora = datetime.now(TZ)
     tick = int(agora.timestamp() // REFRESH_SECONDS)
@@ -799,6 +863,50 @@ def main() -> None:
     except Exception:
         st.button("Atualizar agora", type="primary")
         st.caption("Auto-refresh indisponível; use o botão ou recarregue a página.")
+
+
+def main() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
+        div[data-testid="stMetricValue"] { font-size: 1.6rem; }
+        div[data-testid="stVerticalBlockBorderWrapper"] {
+            background: rgba(255,255,255,0.02);
+            border-radius: 12px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    try:
+        cfg = _load_secrets()
+    except Exception:
+        st.error(
+            "Configure os secrets no Streamlit Cloud (ou em `.streamlit/secrets.toml`). "
+            "Veja `secrets.toml.example`."
+        )
+        st.stop()
+
+    if not cfg["login"] or not cfg["password"]:
+        st.error("Secrets incompletos: informe `zig.login` e `zig.password`.")
+        st.stop()
+
+    with st.sidebar:
+        st.markdown("### Menu")
+        pagina = st.radio(
+            "Navegação",
+            ["Dashboard", "Download de XML"],
+            label_visibility="collapsed",
+            key="menu_pagina",
+        )
+        st.caption("Impettus · RIR26")
+
+    if pagina == "Download de XML":
+        _render_download_xml(cfg)
+    else:
+        _render_dashboard(cfg)
 
 
 if __name__ == "__main__":
