@@ -18,6 +18,8 @@ from bs4 import BeautifulSoup
 TZ = ZoneInfo("America/Sao_Paulo")
 BASE = "https://netpdv.com/backoffice"
 EVENTO_INICIO_DEFAULT = datetime(2026, 8, 29, 8, 0, tzinfo=TZ)
+# Marcador de deploy: XML ZIP por dia operacional
+ZIG_CLIENT_FEATURE = "xml-zip-v1"
 
 # Dias oficiais de evento (abertura da janela 12:00)
 DIAS_OFICIAIS: tuple[date, ...] = (

@@ -24,10 +24,32 @@ from zig_client import (
     SaidaHorariaPonto,
     ZigClient,
     janela_operacional,
-    label_janela,
-    listar_janelas_xml,
     produtos_por_marca,
 )
+try:
+    from zig_client import label_janela, listar_janelas_xml
+except ImportError:  # Cloud pode subir app.py antes do zig_client novo
+    def label_janela(inicio: datetime, fim: datetime) -> str:
+        return f"{inicio.strftime('%d/%m/%Y')} 12:00 - {fim.strftime('%d/%m/%Y')} 07:00"
+
+    def listar_janelas_xml(
+        agora: datetime | None = None,
+    ) -> list[tuple[datetime, datetime]]:
+        agora = agora or datetime.now(TZ)
+        if agora.tzinfo is None:
+            agora = agora.replace(tzinfo=TZ)
+        else:
+            agora = agora.astimezone(TZ)
+        janelas: list[tuple[datetime, datetime]] = []
+        for dia in DIAS_OFICIAIS:
+            inicio = datetime(dia.year, dia.month, dia.day, 12, 0, tzinfo=TZ)
+            fim = (inicio + timedelta(days=1)).replace(
+                hour=7, minute=0, second=0, microsecond=0
+            )
+            if inicio <= agora:
+                janelas.append((inicio, fim))
+        janelas.sort(key=lambda x: x[0], reverse=True)
+        return janelas
 try:
     from zig_client import mesclar_retirada_produto
 except ImportError:  # Cloud pode subir app.py antes do zig_client novo
@@ -175,6 +197,10 @@ def gerar_zip_xml_dia(
     fim = (inicio + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)
     label = label_janela(inicio, fim)
     client = ZigClient(login=login, password=password, evento_id=evento_id)
+    if not hasattr(client, "baixar_zip_xmls_periodo"):
+        raise RuntimeError(
+            "zig_client desatualizado no deploy. Aguarde o redeploy ou reinicie o app."
+        )
     zip_bytes, listadas, ok, fail = client.baixar_zip_xmls_periodo(inicio, fim)
     return zip_bytes, listadas, ok, fail, label
 
