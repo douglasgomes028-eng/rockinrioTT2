@@ -205,6 +205,64 @@ def gerar_zip_xml_dia(
     return zip_bytes, listadas, ok, fail, label
 
 
+def _mesclar_zips_por_dia(partes: list[tuple[str, bytes]]) -> bytes:
+    """Une ZIPs diários em um único arquivo com pasta por dia (YYYYMMDD/)."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for dia_iso, day_bytes in partes:
+            pasta = dia_iso.replace("-", "")
+            if not day_bytes:
+                continue
+            with zipfile.ZipFile(io.BytesIO(day_bytes), "r") as zin:
+                for info in zin.infolist():
+                    if info.is_dir():
+                        continue
+                    nome = info.filename.rsplit("/", 1)[-1]
+                    zout.writestr(f"{pasta}/{nome}", zin.read(info.filename))
+    return buf.getvalue()
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def gerar_zip_xml_todos(
+    login: str,
+    password: str,
+    evento_id: int,
+    dias_iso: tuple[str, ...],
+    _cache_ver: int = 1,
+) -> tuple[bytes, int, int, int, int]:
+    """
+    Gera um ZIP único com XMLs de todos os dias (pastas YYYYMMDD/).
+    Retorna (zip_bytes, dias_ok, listadas, xml_ok, xml_fail).
+    """
+    client = ZigClient(login=login, password=password, evento_id=evento_id)
+    if not hasattr(client, "baixar_zip_xmls_periodo"):
+        raise RuntimeError(
+            "zig_client desatualizado no deploy. Aguarde o redeploy ou reinicie o app."
+        )
+    partes: list[tuple[str, bytes]] = []
+    listadas = 0
+    ok = 0
+    fail = 0
+    dias_ok = 0
+    for dia_iso in dias_iso:
+        dia = date.fromisoformat(dia_iso)
+        inicio = datetime(dia.year, dia.month, dia.day, 12, 0, tzinfo=TZ)
+        fim = (inicio + timedelta(days=1)).replace(
+            hour=7, minute=0, second=0, microsecond=0
+        )
+        zb, n_list, n_ok, n_fail = client.baixar_zip_xmls_periodo(inicio, fim)
+        listadas += n_list
+        ok += n_ok
+        fail += n_fail
+        if n_ok > 0:
+            partes.append((dia_iso, zb))
+            dias_ok += 1
+    return _mesclar_zips_por_dia(partes), dias_ok, listadas, ok, fail
+
+
 def _render_download_xml(cfg: dict) -> None:
     st.title("Download de XML — Notas Fiscais")
     st.caption(
@@ -217,7 +275,52 @@ def _render_download_xml(cfg: dict) -> None:
         st.info("Nenhum dia operacional iniciado ainda.")
         return
 
-    st.markdown(f"**{len(janelas)}** dia(s) disponível(is) para download.")
+    dias_iso = tuple(ini.date().isoformat() for ini, _fim in janelas)
+    col_info, col_all = st.columns([2, 1])
+    with col_info:
+        st.markdown(f"**{len(janelas)}** dia(s) disponível(is) para download.")
+    with col_all:
+        gerar_todos = st.button(
+            "Gerar ZIP de todos os dias",
+            key="xml_gerar_todos",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if gerar_todos:
+        st.session_state["xml_ready_todos"] = True
+
+    if st.session_state.get("xml_ready_todos"):
+        with st.spinner(
+            f"Gerando XMLs de {len(dias_iso)} dia(s) — pode levar vários minutos..."
+        ):
+            try:
+                zip_todos, dias_ok, listadas, ok, fail = gerar_zip_xml_todos(
+                    cfg["login"],
+                    cfg["password"],
+                    cfg["evento_id"],
+                    dias_iso,
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Falha ao gerar o ZIP de todos os dias: {exc}")
+                st.session_state["xml_ready_todos"] = False
+            else:
+                st.success(
+                    f"{ok} XML(s) em {dias_ok} dia(s)"
+                    + (f" · {fail} falha(s)" if fail else "")
+                    + f" · {listadas} nota(s) listadas"
+                )
+                if ok > 0:
+                    st.download_button(
+                        label="Baixar ZIP de todos os dias",
+                        data=zip_todos,
+                        file_name="xml_nf_todos_dias.zip",
+                        mime="application/zip",
+                        key="xml_dl_todos",
+                        type="primary",
+                    )
+                else:
+                    st.warning("Nenhum XML disponível nos dias selecionados.")
 
     for inicio, fim in janelas:
         dia_iso = inicio.date().isoformat()
